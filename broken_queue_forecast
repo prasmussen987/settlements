@@ -1,0 +1,1614 @@
+--Comments / Notes / Items to change
+
+        --I am looking at the time period during which creditor payments are being made - need to look at 36 months out as there are some programs that go red-runner after the offer term is over
+
+
+--End Notes
+
+
+--36 months out filter does not seem to be working correctly - looks to be tagging tls it shouldn't be for some reason
+
+--Updated logic included here 
+    --Leveraging payment structures in the creditor table and not using equal pay for all
+    --Front-loading settlement fees when 75% of fees paid in the first 5 periods
+    
+--Setting settlement estimate defaults
+Set Settle_Rate = 60;
+Set Pmt_Term = 12;
+Set Min_Pay_Amt = 25;
+Set FirstPmtMonth = 1; --Sets with first creditor and beyond payments occur; 1 = current month and 0 = next_month
+Set QueueMonth = '2024-02-29';
+Set DQ_Buffer = 0; --Buffer (in days) added to the creditor-level min dq
+
+--drop table BA_SANDBOX.PRASMUSSEN.elig_queues_first_pmt_next_mo_feb_frnt_feb_2;
+create table BA_SANDBOX.PRASMUSSEN.elig_queues_first_pmt_next_mo_feb_12_v3 as (
+
+
+with
+
+active_tls_at_beg_of_month as (
+
+
+        select distinct
+                pt.tradeline_name,
+                pt.program_name,
+                pt.program_id,
+                pt.tradeline_id,
+                pt.TRADELINE_STATUS,
+                pt.settlement_process_type,
+               
+                --pt.RECORD_EFFECTIVE_START_DATE_TIME_CST::date as record_date_old,
+                ifnull(pt.RECORD_EFFECTIVE_END_DATE_TIME_CST, current_date())::date as record_date,
+                last_day(ifnull(pt.RECORD_EFFECTIVE_END_DATE_TIME_CST, current_date())) as record_month
+
+
+         from curated_prod.crm.tradeline pt           
+         -- join (select CALENDAR_DATE_CST from curated_prod.crm.vw_hourly_calendar 
+         --        where 1=1
+         --            and day_of_month <= 5 --in (1)
+         --            AND CALENDAR_DATE_CST >= '2023-11-01')
+         --   on (CALENDAR_DATE_CST between pt.RECORD_EFFECTIVE_START_DATE_TIME_CST AND nvl(pt.RECORD_EFFECTIVE_END_DATE_TIME_CST, CALENDAR_DATE_CST))
+        where 1=1
+            and pt.TRADELINE_STATUS in ('Pre-Settlement','Settlement In Approval')
+            --and p.is_current_record_flag = true
+            --and ()
+            and (last_day(pt.RECORD_EFFECTIVE_START_DATE_TIME_CST::date) = $QueueMonth or last_day(ifnull(pt.RECORD_EFFECTIVE_END_DATE_TIME_CST, current_date())) = $QueueMonth)
+        qualify ROW_NUMBER() OVER(PARTITION BY pt.tradeline_name ORDER BY ifnull(pt.RECORD_EFFECTIVE_END_DATE_TIME_CST, current_date()) asc) = 1     
+
+
+),
+
+
+
+--pulling in programs with a completed deposit
+programs_with_completed_deposit as (
+
+    select distinct
+        u.program_id,
+        kpi.program_name,
+        case when FIRST_ACTUAL_DEPOSIT_DATE_CST is not null then true else false end as completed_fd_flag
+        
+    from active_tls_at_beg_of_month as u
+    left join curated_prod.summary.program_kpi_summary as kpi
+        on u.program_id = kpi.program_id
+    where 1=1
+        and completed_fd_flag = true
+
+),
+
+--unsettled legal tls
+unsettled_legal_tls as (
+
+    select distinct
+        t.program_id,
+        t.tradeline_id,
+        t.tradeline_name
+
+    from active_tls_at_beg_of_month as u
+    left join curated_prod.crm.tradeline as t
+        on u.program_id = t.program_id and u.tradeline_id != t.tradeline_id and t.is_current_record_flag = true
+    where 1=1
+        and t.TRADELINE_STATUS in ('Pre-Settlement','Settlement In Approval')
+        and t.is_legal_flag = true
+
+),
+
+forbid_non_dq_cases as (
+
+    select distinct
+        u.program_id,
+        c.tradeline_id
+    from active_tls_at_beg_of_month as u
+    left join curated_prod.crm.case as c
+        on u.tradeline_id = c.tradeline_id and c.is_current_record_flag = true
+    where 1=1 
+        and case_status in ('In Progress','New')
+        and c.case_type in ('Non-Delinquent Tradeline')
+        and c.tradeline_id is not null
+
+)
+
+, tradelines_failing_dq_checks as (
+--need to check the creditor specific DQ criteria
+
+    select distinct
+        u.program_id,
+        u.tradeline_id,
+        coalesce(tl.negotiation_balance,tl.enrolled_balance) as negotiation_bal,
+        coalesce(t.negotiating_creditor_id_c,t.originating_creditor_id_c) as negotiating_cred_id,
+        c_neg.CREDITOR_NAME as negotiating_creditor_name,
+
+        datediff('day',dateadd('day', 30, t.last_payment_date_c),current_date()) as current_tl_dq,
+
+        ifnull(ct.DAYS_DELINQUENT_MIN_C,180) + $DQ_Buffer as creditor_min_days_dq, 
+
+        case 
+            when current_tl_dq < 0 then true
+            when current_tl_dq < ifnull(ct.DAYS_DELINQUENT_MIN_C,180) then true
+        else false end as fails_min_dq_creditor_thresholds
+    
+    from active_tls_at_beg_of_month as u
+    left join refined_prod.bedrock.program_tradeline_c as t
+        on u.tradeline_id = t.id and t.is_deleted = false
+
+    left join curated_prod.crm.tradeline as tl
+        on tl.tradeline_id = t.id and tl.is_current_record_flag = true
+    
+    left join curated_prod.crm.creditor as c_neg 
+        on coalesce(t.negotiating_creditor_id_c,t.originating_creditor_id_c) = c_neg.creditor_id and c_neg.is_current_record_flag = true
+    
+    left join (
+        select distinct 
+            creditor_id_c, 
+            DAYS_DELINQUENT_MIN_C
+        from refined_prod.bedrock.creditor_terms_c as ct 
+        where is_Deleted = false
+        qualify row_number() over (partition by creditor_id_c order by DAYS_DELINQUENT_MIN_C asc) = 1
+        --order by 1,3
+        ) as ct 
+        
+        on negotiating_cred_id = ct.creditor_id_c
+        
+    where 1=1
+        --and fails_min_dq_creditor_thresholds = true
+
+    --order by 1,2
+
+      
+),
+
+tl_has_an_active_offer as (
+
+    select distinct
+        u.program_id,
+        u.tradeline_id,
+        o.offer_status
+
+    from active_tls_at_beg_of_month as u
+    left join curated_prod.crm.offer as o
+        on u.tradeline_id = o.tradeline_id and o.is_current_record_flag = true 
+    where 1=1
+        and o.offer_status is not null
+        and o.offer_status not in ('Cancelled','Rejected','Expired')
+)
+
+
+
+-- forbid_legal_tl as (
+
+--     select distinct
+--         u.program_id,
+--         u.tradeline_id,
+--         t.is_legal_flag
+
+--     from active_tls_at_beg_of_month as u
+--     left join curated_prod.crm.tradeline as t
+--         on u.tradeline_id = t.tradeline_id and t.is_current_record_flag = true
+--     where 1=1
+--         and t.is_legal_flag = true
+--         and t.tradeline_name is not null
+
+-- ),
+
+
+//** ## Begin Affordability Checks
+
+
+
+--##### Begin Forecasted Monthly CFT Balances
+
+--this runner cte gets the current projected transactions from today going forward
+--it'll be very similar to the runner in the affordability queries
+
+, runner as (
+    SELECT
+        at.program_id_c as program_id
+        , p.program_name
+        , at.offer_id_c as offer_id
+        , CASE 
+            WHEN at.offer_id_c IS NOT NULL AND o.first_payment_made_date_cst IS NOT NULL THEN 1 
+            WHEN at.offer_id_c IS NOT NULL AND o.first_payment_made_date_cst IS NULL THEN 0
+            ELSE NULL END as first_payment 
+        , o.is_conditional_offer_flag
+        , at.id as transaction_id
+        , at.status_c as transaction_status
+        , CASE WHEN at.type_c = 'Fee' AND at.amount_c <> 10.75 AND at.amount_c <> 14.95 AND at.amount_c <> 9.95 THEN 'Settlement Fee' ELSE at.type_c END as transaction_type
+        , CASE WHEN at.type_c NOT IN ('Deposit', 'Reversal', 'Loan', 'Advance', 'Refund') THEN ROUND(-at.amount_c,2) ELSE ROUND(at.amount_c,2) END as transaction_amount
+        , CASE WHEN at.type_c = 'Deposit' THEN at.scheduled_date_c + 5 ELSE at.scheduled_date_c END as adj_scheduled_date_cst
+    FROM refined_prod.bedrock.transaction_c at
+    LEFT JOIN curated_prod.crm.offer o ON at.offer_id_c = o.offer_id AND o.is_current_record_flag
+    LEFT JOIN curated_prod.crm.program p ON at.program_id_c = p.program_id AND p.is_current_record_flag
+    WHERE at.status_c NOT IN ('Cancelled', 'Returned', 'Suspended', 'Failed', 'Stopped')
+    AND adj_scheduled_date_cst >= current_date 
+    AND NOT(at.type_c = 'Deposit' AND at.status_c = 'Proposal')
+    AND NOT(at.type_c = 'Fee' AND lower(at.subtype_c) <> 'settlement fee' AND at.status_c = 'Proposal')
+    AND NOT(type_c = 'Deposit' AND status_c IN ('In_Transit', 'In_Delivery') AND datediff(day, scheduled_date_c, current_date) >5)
+    AND NOT(adj_scheduled_date_cst >= current_date AND at.status_c = 'Completed' AND type_c = 'Deposit')
+    AND at.is_deleted = false
+    AND (o.offer_status IS NULL OR o.offer_status NOT IN ('Expired', 'Cancelled', 'Rejected'))
+    --AND at.program_id_c = 'a165d00000M85W4AAJ'
+    AND p.program_status = 'Enrolled'
+    --and right(p.program_name,2) = ('12')
+    --and at.program_id_c in ('a165d00000Lp7EHAAZ','a165d00000LibjsAAB','a165d00000LiqPJAAZ')
+    --and p.program_name in ('BRP-097158')
+    --and p.enrolled_date_cst >= ('2023-07-01')
+
+    ORDER BY at.program_id_c, adj_scheduled_date_cst ASC
+)
+
+--gets the current balance for each program based on all transactions in their ledger up to today
+--essentially the same as the affordability current balance cte
+, current_balance as (
+    SELECT
+        program_id
+        , running_balance as current_balance
+    FROM (
+        SELECT
+            at.program_id_c as program_id
+            , p.program_name
+            , at.offer_id_c as offer_id
+            , at.status_c as transaction_status
+            , at.type_c as transaction_type
+            , CASE WHEN at.type_c NOT IN ('Deposit', 'Reversal', 'Loan', 'Advance', 'Refund') THEN -at.amount_c ELSE at.amount_c END as transaction_amount
+            , CASE WHEN at.type_c = 'Deposit' THEN at.scheduled_date_c + 5 ELSE at.scheduled_date_c END as adj_scheduled_date_cst
+            , SUM(transaction_amount) OVER(PARTITION BY at.program_id_c ORDER BY adj_scheduled_date_cst ASC) as running_balance
+        FROM refined_prod.bedrock.transaction_c at
+        LEFT JOIN curated_prod.crm.offer o ON at.offer_id_c = o.offer_id AND o.is_current_record_flag
+        LEFT JOIN curated_prod.crm.program p ON at.program_id_c = p.program_id AND p.is_current_record_flag
+        WHERE at.status_c NOT IN ('Cancelled', 'Returned', 'Suspended', 'Failed', 'Stopped', 'Proposal', 'Estimate')
+        AND (adj_scheduled_date_cst < current_date OR (type_c = 'Deposit' AND status_c = 'Completed'))
+        AND (datediff(day, adj_scheduled_date_cst, current_date) <= 30 OR at.status_c NOT IN ('In_Transit', 'Pending', 'In_Delivery', 'Scheduled', 'Estimate') OR at.amount_c <> -10.75 OR at.amount_c <> -14.95)
+        AND at.is_deleted = false
+        AND NOT(type_c = 'Deposit' AND status_c IN ('In_Transit', 'In_Delivery') AND datediff(day, scheduled_date_c, current_date) >5)
+        --AND at.program_id_c = 'a165d00000M85W4AAJ'
+        --and at.program_id_c in ('a165d00000Lp7EHAAZ','a165d00000LibjsAAB','a165d00000LiqPJAAZ')
+        AND p.program_status = 'Enrolled'
+        --and right(p.program_name,2) = ('12')
+        --and p.program_name in ('BRP-097158')
+        --and p.enrolled_date_cst >= ('2023-07-01')
+
+        QUALIFY ROW_NUMBER() OVER(PARTITION BY at.program_id_c ORDER BY adj_scheduled_date_cst DESC) = 1
+        ORDER BY at.program_id_c, adj_scheduled_date_cst ASC
+    )
+)
+
+--again same as affordability, uses the current balance and the future transactions to project out the running balance
+, running_balance as (
+    SELECT 
+        r.*
+        , cb.current_balance
+        , round(sum(transaction_amount) over (partition by r.program_id order by adj_scheduled_date_cst asc) + cb.current_balance,2) as running_balance
+    FROM runner r
+    LEFT JOIN current_balance cb ON r.program_id = cb.program_id
+    ORDER BY program_id, adj_scheduled_date_cst
+)
+
+
+---Grabbing forecasted month-end CFT balance
+, forecasted_cft_balance as (
+
+    select distinct
+        program_id,
+        program_name,
+        scheduled_month_cst,
+        ending_balance
+    from (
+            SELECT 
+                program_id
+                , program_name
+                , offer_id
+                , first_payment
+                , is_conditional_offer_flag
+                , transaction_id
+                , transaction_status
+                , transaction_type
+                , transaction_amount
+                , adj_scheduled_date_cst as scheduled_date_cst
+                , last_day(adj_scheduled_date_cst) as scheduled_month_cst
+                , lag(running_balance) OVER (PARTITION BY program_id ORDER BY scheduled_date_cst) as starting_balance
+                , running_balance as ending_balance
+                , ROW_NUMBER() OVER(PARTITION BY program_id,scheduled_month_cst ORDER BY adj_scheduled_date_cst DESC, ending_balance desc) as txn_rank
+            FROM running_balance r
+            WHERE 1=1
+            ORDER BY program_id, scheduled_date_cst, transaction_id
+        )
+    where 1=1
+        and txn_rank = 1
+        and scheduled_month_cst >= last_day(current_date)
+        and scheduled_month_cst <= add_months(last_day(current_date),36)
+    order by 2,3
+
+)
+
+, max_cft_scheduled_month as (
+
+    select distinct
+        program_id,
+        scheduled_month_cst
+    from forecasted_cft_balance
+    qualify ROW_NUMBER() OVER(PARTITION BY program_id ORDER BY scheduled_month_cst DESC) = 1
+
+
+)
+
+
+--##### Begin Forecasted Monthly Creditor Payments and Beyond Fees
+    
+
+, creditor_matrix_build as (
+        select distinct
+            CREDITOR_ID_C,
+            ORIGINAL_CREDITOR_ID_C,
+            DAYS_DELINQUENT_MIN_C,
+            case 
+                when creditor_id_c in ('a0y3h000000wAhlAAE') and DAYS_DELINQUENT_MAX_C = 210 then 1000000 --accounting for creditors that have a max DQ
+                when creditor_id_c in ('a0y3h0000015MdvAAE') and DAYS_DELINQUENT_MAX_C = 120 then 1000000
+            else ifnull(DAYS_DELINQUENT_MAX_C,1000000) end as DAYS_DELINQUENT_MAX_C_ADJ,
+            OFFER_PERCENT_C,
+            OFFER_TERM_C,
+            MINIMUM_TRADELINE_BALANCE_C,
+            ifnull(MAXIMUM_TRADELINE_BALANCE_C,1000000) as MAXIMUM_TRADELINE_BALANCE_C_ADJ,
+            SERVICE_ENTITY_CODE_C,
+            CREDITOR_TYPE_C,
+            OFFER_MINIMUM_PAYMENT_C,
+            PAYMENT_STRUCTURE_C,
+            MINIMUM_PAYMENTS_ALLOWED_C
+    
+        from refined_prod.bedrock.creditor_terms_c
+        where 1=1
+            and is_deleted = false
+            --and creditor_id_c in ('a0y3h0000015BqnAAE')
+
+)
+
+,tl_forecast_settlement_rates as (
+    select distinct
+        tl.program_id,
+        tl.tradeline_id,
+        tl.tradeline_status,
+        p.SETTLEMENT_FEE_PERCENTAGE,
+        
+        coalesce(tl.negotiation_balance,tl.LATEST_TRADELINE_BALANCE,tl.enrolled_balance,tl.fee_basis_balance) as negotiation_bal,
+        coalesce(tl.fee_basis_balance,tl.enrolled_balance,tl.negotiation_balance,tl.BULK_MATCHING_CURRENT_BALANCE,tl.LATEST_TRADELINE_BALANCE) as fee_basis_bal,
+        --coalesce(t.negotiating_creditor_id_c,t.originating_creditor_id_c) as negotiating_cred_id,
+        t.negotiating_creditor_id_c as negotiating_cred_id,
+        t.originating_creditor_id_c,
+        case when p.service_entity_name ilike ('%Five%') then 'Five_Lakes' else 'Beyond_Finance' end as service_entity_name_adj,
+        tl.settlement_process_type,
+        case when tl.settlement_process_type in ('Scrub') then 'Bulk' else 'Floor' end as settlement_process_type_adj,
+        
+        c_neg.CREDITOR_NAME as negotiating_creditor_name,
+
+        iff(ifnull(datediff('day',dateadd('day', 30, t.last_payment_date_c),current_date()),0) < 0,0,ifnull(datediff('day',dateadd('day', 30, t.last_payment_date_c),current_date()),0)) as current_tl_dq,
+
+        case 
+            when current_tl_dq < 0 then true
+            when current_tl_dq < ifnull(ctm.DAYS_DELINQUENT_MIN_C,180 + $DQ_Buffer) then true
+            when ifnull(t.charged_off_flag_c,false) = false then true
+        else false end as fails_min_dq_creditor_thresholds,
+        
+        case when fails_min_dq_creditor_thresholds = true then null else iff(coalesce(ct.OFFER_PERCENT_C,ct2.OFFER_PERCENT_C) is null,true,false) end as using_default_creditor_terms_flag,
+
+        case when fails_min_dq_creditor_thresholds = true then null else coalesce(ct.OFFER_PERCENT_C,ct2.OFFER_PERCENT_C,$Settle_Rate) end as OFFER_PERCENT_C_COAL,
+        case when fails_min_dq_creditor_thresholds = true then null else coalesce(ct.OFFER_TERM_C,ct2.OFFER_TERM_C,$Pmt_Term) end as OFFER_TERM_C_COAL,
+        case when fails_min_dq_creditor_thresholds = true then null else coalesce(ct.OFFER_MINIMUM_PAYMENT_C,ct2.OFFER_MINIMUM_PAYMENT_C,$Min_Pay_Amt) end as OFFER_MINIMUM_PAYMENT_C_COAL,
+        case when fails_min_dq_creditor_thresholds = true then null else coalesce(ct.PAYMENT_STRUCTURE_C,ct2.PAYMENT_STRUCTURE_C,'Undefined') end as PAYMENT_STRUCTURE_C_COAL,
+        case when fails_min_dq_creditor_thresholds = true then null else coalesce(ct.MINIMUM_PAYMENTS_ALLOWED_C,ct2.MINIMUM_PAYMENTS_ALLOWED_C) end as MINIMUM_PAYMENTS_ALLOWED_C_COAL,    
+
+ --       case when fails_min_dq_creditor_thresholds = true then null else iff(coalesce(ct.OFFER_PERCENT_C,ct2.OFFER_PERCENT_C) is null,true,false) end as using_default_creditor_terms_flag,
+
+        negotiation_bal * (OFFER_PERCENT_C_COAL / 100) ::decimal(15,2) as est_settlement_amount,
+        fee_basis_bal * (ifnull(p.SETTLEMENT_FEE_PERCENTAGE,25) / 100) ::decimal(15,2) as settlement_fee,
+
+        --Determining the number of monthly payments to be made based on payment structure
+        case 
+            when PAYMENT_STRUCTURE_C_COAL in ('Undefined','Even Pay','Min Pay Even') and (OFFER_TERM_C_COAL * OFFER_MINIMUM_PAYMENT_C_COAL) < est_settlement_amount then OFFER_TERM_C_COAL --covers all payments
+            when PAYMENT_STRUCTURE_C_COAL in ('Min Pay Even') then greatest(round((est_settlement_amount / OFFER_MINIMUM_PAYMENT_C_COAL),0),1)
+            
+            when PAYMENT_STRUCTURE_C_COAL in ('Undefined','Even Pay') and (OFFER_MINIMUM_PAYMENT_C_COAL * OFFER_TERM_C_COAL) >= est_settlement_amount then greatest(floor(est_settlement_amount / OFFER_MINIMUM_PAYMENT_C_COAL),1)
+            when PAYMENT_STRUCTURE_C_COAL in ('Undefined','Even Pay') and (OFFER_MINIMUM_PAYMENT_C_COAL * OFFER_TERM_C_COAL) < est_settlement_amount then least(floor(est_settlement_amount / OFFER_MINIMUM_PAYMENT_C_COAL),OFFER_TERM_C_COAL)            
+
+            when PAYMENT_STRUCTURE_C_COAL in ('Min Pay Balloon','Min Pay Limited Even') then OFFER_TERM_C_COAL
+        else 12 end as adj_count_of_cred_pmt,
+
+        --number of second set of payments
+        case 
+            when PAYMENT_STRUCTURE_C_COAL in ('Undefined','Even Pay','Min Pay Even') then 0
+            when PAYMENT_STRUCTURE_C_COAL in ('Min Pay Balloon') then 1
+            when PAYMENT_STRUCTURE_C_COAL in ('Min Pay Limited Even') then adj_count_of_cred_pmt - MINIMUM_PAYMENTS_ALLOWED_C_COAL
+        else 0 end as count_final_set_of_payments,
+
+        --first set of payments
+        adj_count_of_cred_pmt - count_final_set_of_payments as count_first_set_cred_pmt,
+
+        --when does the second set of cred payments begin and end?
+        case when ifnull(count_final_set_of_payments,0) = 0 then 0 else count_first_set_cred_pmt + 1 end as final_pmt_beg,
+        case when final_pmt_beg = 0 then 0 else final_pmt_beg + count_final_set_of_payments - 1 end as final_pmt_end,
+        
+
+        case when count_final_set_of_payments > 0 then least(OFFER_MINIMUM_PAYMENT_C_COAL,(est_settlement_amount / OFFER_TERM_C_COAL))
+            else(est_settlement_amount / adj_count_of_cred_pmt) end :: decimal(15,2) as first_set_pmt_amt,
+
+        --least(OFFER_MINIMUM_PAYMENT_C_COAL,(est_settlement_amount / OFFER_TERM_C_COAL)) as first_set_pmt_amt,
+
+        case when count_final_set_of_payments = 0 then 0 else ((est_settlement_amount - (first_set_pmt_amt * count_first_set_cred_pmt)) / count_final_set_of_payments) end :: decimal(15,2) as final_set_pmt_amt,
+
+
+        case when adj_count_of_cred_pmt <= 24 then adj_count_of_cred_pmt else 24 end as cnt_settle_fee_pmts, --max number of payments = 24
+
+        --Front-loading beyond settlement fees so 75% of settlement fee is paid back in the first 5 months - the remaining balance is paid off evenly on the remaining term (up until 24 months)
+        case 
+            when cnt_settle_fee_pmts <= 5 then settlement_fee / cnt_settle_fee_pmts
+            else (settlement_fee * 0.75 ) / 5 end :: decimal(15,2) as sfee_frst5, --monthly settlement fee for the first 5 payments
+
+        case 
+            when cnt_settle_fee_pmts <= 5 then 0
+            else (settlement_fee * 0.25 ) / (cnt_settle_fee_pmts - 5) end :: decimal(15,2) as sfee_post5, --monthly settlement fee for payments 6+
+        settlement_fee / cnt_settle_fee_pmts ::decimal(15,2) as monthly_sett_fee
+
+
+        
+    from refined_prod.bedrock.program_tradeline_c as t
+        
+    left join curated_prod.crm.tradeline as tl
+        on tl.tradeline_id = t.id and tl.is_current_record_flag = true
+
+    left join curated_prod.crm.program as p
+        on tl.program_name = p.program_name and tl.is_current_record_flag = true
+    
+    left join curated_prod.crm.creditor as c_neg 
+    on coalesce(t.negotiating_creditor_id_c,t.originating_creditor_id_c) = c_neg.creditor_id and c_neg.is_current_record_flag = true
+
+    left join (
+        select distinct 
+            creditor_id_c, 
+            DAYS_DELINQUENT_MIN_C
+        from refined_prod.bedrock.creditor_terms_c as ct 
+        where is_Deleted = false
+        qualify row_number() over (partition by creditor_id_c order by DAYS_DELINQUENT_MIN_C asc) = 1
+        --order by 1,3
+        ) as ctm
+        
+        on negotiating_cred_id = ctm.creditor_id_c
+    
+    left join creditor_matrix_build as ct 
+        on negotiating_cred_id = ct.creditor_id_c
+            and case when t.originating_creditor_id_c = ct.ORIGINAL_CREDITOR_ID_C then t.originating_creditor_id_c = ct.ORIGINAL_CREDITOR_ID_C else ct.ORIGINAL_CREDITOR_ID_C is null end
+            and settlement_process_type_adj = ct.CREDITOR_TYPE_C
+            and service_entity_name_adj = ct.SERVICE_ENTITY_CODE_C
+            and negotiation_bal between ct.MINIMUM_TRADELINE_BALANCE_C and ct.MAXIMUM_TRADELINE_BALANCE_C_ADJ
+            and current_tl_dq between ct.DAYS_DELINQUENT_MIN_C and ct.DAYS_DELINQUENT_MAX_C_ADJ
+
+    --For creditors that have TLs listed under multiple settlement processes
+    left join creditor_matrix_build as ct2 
+        on negotiating_cred_id = ct2.creditor_id_c
+            and case when t.originating_creditor_id_c = ct2.ORIGINAL_CREDITOR_ID_C then t.originating_creditor_id_c = ct2.ORIGINAL_CREDITOR_ID_C else ct2.ORIGINAL_CREDITOR_ID_C is null end
+            and settlement_process_type_adj != ct2.CREDITOR_TYPE_C
+            --and service_entity_name_adj = ct2.SERVICE_ENTITY_CODE_C
+            and negotiation_bal between ct2.MINIMUM_TRADELINE_BALANCE_C and ct2.MAXIMUM_TRADELINE_BALANCE_C_ADJ
+            and current_tl_dq between ct2.DAYS_DELINQUENT_MIN_C and ct2.DAYS_DELINQUENT_MAX_C_ADJ
+
+    -- add additional matrix where settlement process type does not match
+        
+    where 1=1
+        and t.is_deleted = false
+        and fails_min_dq_creditor_thresholds = false
+        and negotiation_bal > 0
+        and p.program_status in ('Enrolled')
+        and tl.TRADELINE_STATUS in ('Pre-Settlement','Settlement In Approval')
+        --and tl.tradeline_id in ('a155d00000aDLbOAAW','a155d00000aEP1RAAW','a155d00000aFX6LAAW')
+        --and tl.program_id in ('a165d00000Lp7EHAAZ','a165d00000LibjsAAB','a165d00000LiqPJAAZ')
+        --and last_day(tradeline_enrolled_date_c) in ('2023-07-31')
+        --and tl.program_id in ('a165d00000Lp7EHAAZ','a165d00000LibjsAAB','a165d00000LiqPJAAZ')
+        --and offer_term_adj <= 3
+        --and negotiating_creditor_name in ('Synchrony Bank Pre-Charge')
+        --and current_tl_dq > 180
+        --and estimated_monthly_payment_adj is null
+        --and using_default_creditor_terms_flag = true
+        --and SETTLEMENT_PROCESS_TYPE_ADJ in ('Bulk')
+        --and right(tl.tradeline_id,1) in ('A')
+        
+        
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY tl.tradeline_id ORDER BY OFFER_TERM_C_COAL asc) = 1
+    --order by OFFER_TERM_ADJ desc
+
+     -- limit 1000
+
+     )
+
+, monthly_creditor_payments as (
+    select distinct
+        program_id,
+        tradeline_id,
+
+
+        case when ADJ_COUNT_OF_CRED_PMT < 1 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,1) * FIRST_SET_PMT_AMT + greatest(1 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(1 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(1>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,1 - 1) * FIRST_SET_PMT_AMT + greatest(1 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m1_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 2 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,2) * FIRST_SET_PMT_AMT + greatest(2 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(2 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(2>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,2 - 1) * FIRST_SET_PMT_AMT + greatest(2 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m2_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 3 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,3) * FIRST_SET_PMT_AMT + greatest(3 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(3 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(3>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,3 - 1) * FIRST_SET_PMT_AMT + greatest(3 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m3_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 4 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,4) * FIRST_SET_PMT_AMT + greatest(4 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(4 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(4>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,4 - 1) * FIRST_SET_PMT_AMT + greatest(4 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m4_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 5 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,5) * FIRST_SET_PMT_AMT + greatest(5 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(5 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(5>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,5 - 1) * FIRST_SET_PMT_AMT + greatest(5 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m5_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 6 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,6) * FIRST_SET_PMT_AMT + greatest(6 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(6 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(6>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,6 - 1) * FIRST_SET_PMT_AMT + greatest(6 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m6_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 7 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,7) * FIRST_SET_PMT_AMT + greatest(7 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(7 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(7>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,7 - 1) * FIRST_SET_PMT_AMT + greatest(7 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m7_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 8 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,8) * FIRST_SET_PMT_AMT + greatest(8 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(8 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(8>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,8 - 1) * FIRST_SET_PMT_AMT + greatest(8 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m8_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 9 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,9) * FIRST_SET_PMT_AMT + greatest(9 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(9 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(9>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,9 - 1) * FIRST_SET_PMT_AMT + greatest(9 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m9_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 10 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,10) * FIRST_SET_PMT_AMT + greatest(10 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(10 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(10>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,10 - 1) * FIRST_SET_PMT_AMT + greatest(10 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m10_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 11 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,11) * FIRST_SET_PMT_AMT + greatest(11 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(11 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(11>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,11 - 1) * FIRST_SET_PMT_AMT + greatest(11 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m11_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 12 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,12) * FIRST_SET_PMT_AMT + greatest(12 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(12 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(12>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,12 - 1) * FIRST_SET_PMT_AMT + greatest(12 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m12_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 13 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,13) * FIRST_SET_PMT_AMT + greatest(13 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(13 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(13>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,13 - 1) * FIRST_SET_PMT_AMT + greatest(13 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m13_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 14 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,14) * FIRST_SET_PMT_AMT + greatest(14 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(14 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(14>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,14 - 1) * FIRST_SET_PMT_AMT + greatest(14 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m14_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 15 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,15) * FIRST_SET_PMT_AMT + greatest(15 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(15 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(15>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,15 - 1) * FIRST_SET_PMT_AMT + greatest(15 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m15_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 16 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,16) * FIRST_SET_PMT_AMT + greatest(16 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(16 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(16>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,16 - 1) * FIRST_SET_PMT_AMT + greatest(16 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m16_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 17 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,17) * FIRST_SET_PMT_AMT + greatest(17 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(17 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(17>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,17 - 1) * FIRST_SET_PMT_AMT + greatest(17 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m17_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 18 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,18) * FIRST_SET_PMT_AMT + greatest(18 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(18 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(18>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,18 - 1) * FIRST_SET_PMT_AMT + greatest(18 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m18_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 19 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,19) * FIRST_SET_PMT_AMT + greatest(19 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(19 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(19>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,19 - 1) * FIRST_SET_PMT_AMT + greatest(19 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m19_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 20 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,20) * FIRST_SET_PMT_AMT + greatest(20 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(20 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(20>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,20 - 1) * FIRST_SET_PMT_AMT + greatest(20 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m20_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 21 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,21) * FIRST_SET_PMT_AMT + greatest(21 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(21 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(21>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,21 - 1) * FIRST_SET_PMT_AMT + greatest(21 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m21_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 22 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,22) * FIRST_SET_PMT_AMT + greatest(22 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(22 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(22>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,22 - 1) * FIRST_SET_PMT_AMT + greatest(22 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m22_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 23 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,23) * FIRST_SET_PMT_AMT + greatest(23 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(23 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(23>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,23 - 1) * FIRST_SET_PMT_AMT + greatest(23 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m23_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 24 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,24) * FIRST_SET_PMT_AMT + greatest(24 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(24 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(24>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,24 - 1) * FIRST_SET_PMT_AMT + greatest(24 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m24_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 25 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,25) * FIRST_SET_PMT_AMT + greatest(25 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(25 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(25>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,25 - 1) * FIRST_SET_PMT_AMT + greatest(25 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m25_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 26 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,26) * FIRST_SET_PMT_AMT + greatest(26 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(26 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(26>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,26 - 1) * FIRST_SET_PMT_AMT + greatest(26 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m26_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 27 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,27) * FIRST_SET_PMT_AMT + greatest(27 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(27 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(27>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,27 - 1) * FIRST_SET_PMT_AMT + greatest(27 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m27_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 28 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,28) * FIRST_SET_PMT_AMT + greatest(28 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(28 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(28>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,28 - 1) * FIRST_SET_PMT_AMT + greatest(28 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m28_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 29 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,29) * FIRST_SET_PMT_AMT + greatest(29 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(29 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(29>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,29 - 1) * FIRST_SET_PMT_AMT + greatest(29 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m29_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 30 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,30) * FIRST_SET_PMT_AMT + greatest(30 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(30 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(30>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,30 - 1) * FIRST_SET_PMT_AMT + greatest(30 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m30_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 31 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,31) * FIRST_SET_PMT_AMT + greatest(31 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(31 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(31>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,31 - 1) * FIRST_SET_PMT_AMT + greatest(31 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m31_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 32 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,32) * FIRST_SET_PMT_AMT + greatest(32 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(32 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(32>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,32 - 1) * FIRST_SET_PMT_AMT + greatest(32 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m32_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 33 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,33) * FIRST_SET_PMT_AMT + greatest(33 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(33 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(33>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,33 - 1) * FIRST_SET_PMT_AMT + greatest(33 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m33_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 34 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,34) * FIRST_SET_PMT_AMT + greatest(34 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(34 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(34>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,34 - 1) * FIRST_SET_PMT_AMT + greatest(34 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m34_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 35 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,35) * FIRST_SET_PMT_AMT + greatest(35 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(35 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(35>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,35 - 1) * FIRST_SET_PMT_AMT + greatest(35 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m35_pmt,
+        case when ADJ_COUNT_OF_CRED_PMT < 36 then 0 when (least(COUNT_FIRST_SET_CRED_PMT,36) * FIRST_SET_PMT_AMT + greatest(36 - final_pmt_beg + 1,0) * FINAL_SET_PMT_AMT) <= est_settlement_amount then iff(36 <= COUNT_FIRST_SET_CRED_PMT,FIRST_SET_PMT_AMT,iff(36>=final_pmt_beg,FINAL_SET_PMT_AMT,0)) else greatest(est_settlement_amount - (least(COUNT_FIRST_SET_CRED_PMT,36 - 1) * FIRST_SET_PMT_AMT + greatest(36 - final_pmt_beg,0) * FINAL_SET_PMT_AMT)) end as m36_pmt
+
+
+ 
+    
+    from tl_forecast_settlement_rates
+    where 1=1
+    order by 1,2
+
+
+    )
+    
+
+, monthly_settlement_fees as (
+    select distinct
+        program_id,
+        tradeline_id,
+        --offer_term_adj,
+    
+        --first 5 payments
+        case when cnt_settle_fee_pmts < 1 then 0 when cnt_settle_fee_pmts >= 1 and (sfee_frst5 * 1) <= settlement_fee then sfee_frst5 else greatest(settlement_fee - (sfee_frst5 * 0),0) end as m1_fee,
+        case when cnt_settle_fee_pmts < 2 then 0 when cnt_settle_fee_pmts >= 2 and (sfee_frst5 * 2) <= settlement_fee then sfee_frst5 else greatest(settlement_fee - (sfee_frst5 * 1),0) end as m2_fee,
+        case when cnt_settle_fee_pmts < 3 then 0 when cnt_settle_fee_pmts >= 3 and (sfee_frst5 * 3) <= settlement_fee then sfee_frst5 else greatest(settlement_fee - (sfee_frst5 * 2),0) end as m3_fee,
+        case when cnt_settle_fee_pmts < 4 then 0 when cnt_settle_fee_pmts >= 4 and (sfee_frst5 * 4) <= settlement_fee then sfee_frst5 else greatest(settlement_fee - (sfee_frst5 * 3),0) end as m4_fee,
+        case when cnt_settle_fee_pmts < 5 then 0 when cnt_settle_fee_pmts >= 5 and (sfee_frst5 * 5) <= settlement_fee then sfee_frst5 else greatest(settlement_fee - (sfee_frst5 * 4),0) end as m5_fee,
+
+        --6th to 24th payments
+        case when cnt_settle_fee_pmts < 6 then 0 when cnt_settle_fee_pmts >= 6 and ((sfee_frst5 * 5) + (sfee_post5 * 1)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 0)),0) end as m6_fee,
+        case when cnt_settle_fee_pmts < 7 then 0 when cnt_settle_fee_pmts >= 7 and ((sfee_frst5 * 5) + (sfee_post5 * 2)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 1)),0) end as m7_fee,
+        case when cnt_settle_fee_pmts < 8 then 0 when cnt_settle_fee_pmts >= 8 and ((sfee_frst5 * 5) + (sfee_post5 * 3)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 2)),0) end as m8_fee,
+        case when cnt_settle_fee_pmts < 9 then 0 when cnt_settle_fee_pmts >= 9 and ((sfee_frst5 * 5) + (sfee_post5 * 4)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 3)),0) end as m9_fee,
+        case when cnt_settle_fee_pmts < 10 then 0 when cnt_settle_fee_pmts >= 10 and ((sfee_frst5 * 5) + (sfee_post5 * 5)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 4)),0) end as m10_fee,
+        case when cnt_settle_fee_pmts < 11 then 0 when cnt_settle_fee_pmts >= 11 and ((sfee_frst5 * 5) + (sfee_post5 * 6)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 5)),0) end as m11_fee,
+        case when cnt_settle_fee_pmts < 12 then 0 when cnt_settle_fee_pmts >= 12 and ((sfee_frst5 * 5) + (sfee_post5 * 7)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 6)),0) end as m12_fee,
+        case when cnt_settle_fee_pmts < 13 then 0 when cnt_settle_fee_pmts >= 13 and ((sfee_frst5 * 5) + (sfee_post5 * 8)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 7)),0) end as m13_fee,
+        case when cnt_settle_fee_pmts < 14 then 0 when cnt_settle_fee_pmts >= 14 and ((sfee_frst5 * 5) + (sfee_post5 * 9)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 8)),0) end as m14_fee,
+        case when cnt_settle_fee_pmts < 15 then 0 when cnt_settle_fee_pmts >= 15 and ((sfee_frst5 * 5) + (sfee_post5 * 10)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 9)),0) end as m15_fee,
+        case when cnt_settle_fee_pmts < 16 then 0 when cnt_settle_fee_pmts >= 16 and ((sfee_frst5 * 5) + (sfee_post5 * 11)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 10)),0) end as m16_fee,
+        case when cnt_settle_fee_pmts < 17 then 0 when cnt_settle_fee_pmts >= 17 and ((sfee_frst5 * 5) + (sfee_post5 * 12)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 11)),0) end as m17_fee,
+        case when cnt_settle_fee_pmts < 18 then 0 when cnt_settle_fee_pmts >= 18 and ((sfee_frst5 * 5) + (sfee_post5 * 13)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 12)),0) end as m18_fee,
+        case when cnt_settle_fee_pmts < 19 then 0 when cnt_settle_fee_pmts >= 19 and ((sfee_frst5 * 5) + (sfee_post5 * 14)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 13)),0) end as m19_fee,
+        case when cnt_settle_fee_pmts < 20 then 0 when cnt_settle_fee_pmts >= 20 and ((sfee_frst5 * 5) + (sfee_post5 * 15)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 14)),0) end as m20_fee,
+        case when cnt_settle_fee_pmts < 21 then 0 when cnt_settle_fee_pmts >= 21 and ((sfee_frst5 * 5) + (sfee_post5 * 16)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 15)),0) end as m21_fee,
+        case when cnt_settle_fee_pmts < 22 then 0 when cnt_settle_fee_pmts >= 22 and ((sfee_frst5 * 5) + (sfee_post5 * 17)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 16)),0) end as m22_fee,
+        case when cnt_settle_fee_pmts < 23 then 0 when cnt_settle_fee_pmts >= 23 and ((sfee_frst5 * 5) + (sfee_post5 * 18)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 17)),0) end as m23_fee,
+        case when cnt_settle_fee_pmts < 24 then 0 when cnt_settle_fee_pmts >= 24 and ((sfee_frst5 * 5) + (sfee_post5 * 19)) <= settlement_fee then sfee_post5 else greatest(settlement_fee - ((sfee_frst5 * 5) + (sfee_post5 * 18)),0) end as m24_fee
+        
+        
+   
+    
+    from tl_forecast_settlement_rates
+    where 1=1
+    order by 1,2 
+    
+    )
+
+,monthly_settlement_fees_to_rows as (
+    
+    select distinct
+        program_id,
+        tradeline_id,
+        REPLACE( REPLACE( month_cat,'M') ,'_FEE') as payment_month,
+        
+        monthly_settlement_fees :: decimal(15,2) as monthly_settlement_fees
+    from (    
+            select *
+            from monthly_settlement_fees
+            unpivot (monthly_settlement_fees
+                    for month_cat in (
+                            m1_fee,
+                            m2_fee,
+                            m3_fee,
+                            m4_fee,
+                            m5_fee,
+                            m6_fee,
+                            m7_fee,
+                            m8_fee,
+                            m9_fee,
+                            m10_fee,
+                            m11_fee,
+                            m12_fee,
+                            m13_fee,
+                            m14_fee,
+                            m15_fee,
+                            m16_fee,
+                            m17_fee,
+                            m18_fee,
+                            m19_fee,
+                            m20_fee,
+                            m21_fee,
+                            m22_fee,
+                            m23_fee,
+                            m24_fee
+                                     )
+                    )   
+        )
+)
+
+,monthly_creditor_payments_to_rows as (
+    
+    select distinct
+        program_id,
+        tradeline_id,
+        REPLACE( REPLACE( month_cat,'M') ,'_PT') as payment_month,
+        
+        monthly_creditor_payments :: decimal(15,2) as monthly_creditor_payments
+    from (    
+            select *
+            from monthly_creditor_payments
+            unpivot (monthly_creditor_payments
+                    for month_cat in (
+                        m1_pmt,
+                        m2_pmt,
+                        m3_pmt,
+                        m4_pmt,
+                        m5_pmt,
+                        m6_pmt,
+                        m7_pmt,
+                        m8_pmt,
+                        m9_pmt,
+                        m10_pmt,
+                        m11_pmt,
+                        m12_pmt,
+                        m13_pmt,
+                        m14_pmt,
+                        m15_pmt,
+                        m16_pmt,
+                        m17_pmt,
+                        m18_pmt,
+                        m19_pmt,
+                        m20_pmt,
+                        m21_pmt,
+                        m22_pmt,
+                        m23_pmt,
+                        m24_pmt,
+                        m25_pmt,
+                        m26_pmt,
+                        m27_pmt,
+                        m28_pmt,
+                        m29_pmt,
+                        m30_pmt,
+                        m31_pmt,
+                        m32_pmt,
+                        m33_pmt,
+                        m34_pmt,
+                        m35_pmt,
+                        m36_pmt
+
+                                     )
+                    )   
+        )
+)
+
+, cft_balance_post_fees_and_payments as ( --only looking at months with creditor payments
+         select distinct
+            cp.program_id,
+            cp.tradeline_id,
+    
+            cp.payment_month - $FirstPmtMonth as payment_months_from_offer, --adjustments to set when the first payment is made to the creditor
+            cp.monthly_creditor_payments as monthly_cred_payments,
+            ifnull(sf.monthly_settlement_fees,0) as monthly_sett_fees,
+
+            SUM(monthly_cred_payments) OVER(PARTITION BY cp.program_id,cp.tradeline_id ORDER BY payment_months_from_offer ASC) as running_total_cred_payments,
+            SUM(monthly_sett_fees) OVER(PARTITION BY cp.program_id,cp.tradeline_id ORDER BY payment_months_from_offer ASC) as running_total_sett_fees,
+    
+            ifnull(cft.scheduled_month_cst,last_day(add_months(current_date(),payment_months_from_offer))) as scheduled_month,
+            ifnull(cft.ending_balance,cb.available_balance) as est_cft_balance, --pulling in current available balance if no forecast
+
+            ifnull(est_cft_balance,0) - ifnull(running_total_cred_payments,0) as ending_cft_balance_adj_only_cred_pmts,
+            ifnull(est_cft_balance,0) - ifnull(running_total_cred_payments,0) - ifnull(running_total_sett_fees,0) as ending_cft_balance_adj,
+
+            --Min CFT balance of $0 for cred payments and $30 for settlement fees - setting min of 30 for up to 24 months and min of 0 for 25 to 36 months since no beyond fees occur after in 24 months (in this query that is...)
+            case 
+                when payment_months_from_offer <= 24 and ending_cft_balance_adj < 30 then true
+                when payment_months_from_offer > 25 and ending_cft_balance_adj < 0 then true
+            else false end as failed_affordability_checks_flag, --setting min 
+
+            iff(scheduled_month > max_m.scheduled_month_cst,true,false) as outside_forecasted_cft_balance_flag,
+
+
+            ROW_NUMBER() OVER(PARTITION BY cp.program_id,cp.tradeline_id ORDER BY payment_months_from_offer asc) as payment_count
+        
+        from monthly_creditor_payments_to_rows as cp
+        left join monthly_settlement_fees_to_rows as sf
+            on cp.tradeline_id = sf.tradeline_id and cp.payment_month = sf.payment_month
+        
+        left join forecasted_cft_balance as cft
+            on cp.program_id = cft.program_id and cft.scheduled_month_cst = last_day(add_months(current_date(),cp.payment_month - $FirstPmtMonth))  --adjustments to set when the first payment is made to the creditor
+
+        left join CURATED_PROD.CFT.DEPOSIT_ACCOUNT_BALANCE as cb
+            on cb.program_id = cp.program_id and cb.as_of_date_cst = current_date()
+        
+        left join max_cft_scheduled_month as max_m
+            on cp.program_id = max_m.program_id
+        where 1=1
+            and monthly_cred_payments > 0
+            --and cp.payment_month < 10
+            --and failed_affordability_checks_flag = true
+        order by 1,2,3
+
+ )
+
+ --Looking to see over the next 36 months if these payments are EVER going to cause the balance to go red - so not just looking the payment term
+ , cft_balance_post_fees_and_payments_out_36_months as (
+         select distinct
+            cp.program_id,
+            cp.tradeline_id,
+    
+            cp.payment_month - $FirstPmtMonth as payment_months_from_offer, --adjustments to set when the first payment is made to the creditor
+            cp.monthly_creditor_payments as monthly_cred_payments,
+            ifnull(sf.monthly_settlement_fees,0) as monthly_sett_fees,
+
+            SUM(monthly_cred_payments) OVER(PARTITION BY cp.program_id,cp.tradeline_id ORDER BY payment_months_from_offer ASC) as running_total_cred_payments,
+            SUM(monthly_sett_fees) OVER(PARTITION BY cp.program_id,cp.tradeline_id ORDER BY payment_months_from_offer ASC) as running_total_sett_fees,
+    
+            ifnull(cft.scheduled_month_cst,last_day(add_months(current_date(),payment_months_from_offer))) as scheduled_month,
+            ifnull(cft.ending_balance,cb.available_balance) as est_cft_balance, --pulling in current available balance if no forecast
+
+            ifnull(est_cft_balance,0) - ifnull(running_total_cred_payments,0) as ending_cft_balance_adj_only_cred_pmts,
+            ifnull(est_cft_balance,0) - ifnull(running_total_cred_payments,0) - ifnull(running_total_sett_fees,0) as ending_cft_balance_adj,
+
+            --Min CFT balance of $0 for cred payments and $30 for settlement fees - setting min of 30 for up to 24 months and min of 0 for 25 to 36 months since no beyond fees occur after in 24 months (in this query that is...)
+            case 
+                when payment_months_from_offer <= 24 and ending_cft_balance_adj < 30 then true
+                when payment_months_from_offer > 25 and ending_cft_balance_adj < 0 then true
+            else false end as failed_affordability_checks_flag, --setting min 
+            
+            iff(scheduled_month > max_m.scheduled_month_cst,true,false) as outside_forecasted_cft_balance_flag,
+
+
+            ROW_NUMBER() OVER(PARTITION BY cp.program_id,cp.tradeline_id ORDER BY payment_months_from_offer asc) as payment_count
+        
+        from monthly_creditor_payments_to_rows as cp
+        left join monthly_settlement_fees_to_rows as sf
+            on cp.tradeline_id = sf.tradeline_id and cp.payment_month = sf.payment_month
+        
+        left join forecasted_cft_balance as cft
+            on cp.program_id = cft.program_id and cft.scheduled_month_cst = last_day(add_months(current_date(),cp.payment_month - $FirstPmtMonth))  --adjustments to set when the first payment is made to the creditor
+
+        left join CURATED_PROD.CFT.DEPOSIT_ACCOUNT_BALANCE as cb
+            on cb.program_id = cp.program_id and cb.as_of_date_cst = current_date()
+
+        left join max_cft_scheduled_month as max_m
+            on cp.program_id = max_m.program_id
+        where 1=1
+            --and monthly_cred_payments > 0
+            --and cp.payment_month < 10
+            --and failed_affordability_checks_flag = true
+        order by 1,2,3
+
+ )
+
+, has_cred_payments_outside_forecasted_cft_balance as (
+
+        select distinct
+            program_id,
+            tradeline_id
+        from cft_balance_post_fees_and_payments
+        where outside_forecasted_cft_balance_flag = true
+
+ 
+ )
+
+
+--Sub Payment Checks for Affordability
+
+, first_payment_check as (
+
+        select distinct
+            program_id,
+            tradeline_id,
+            case when est_cft_balance >= monthly_cred_payments then true else false end as pass_first_payment_check_flag
+        from cft_balance_post_fees_and_payments
+        where 1=1
+            and payment_count = 1
+)
+
+, offer_term_check as (
+
+        select distinct
+            cft.program_id,
+            cft.tradeline_id,
+
+            case 
+                when s.adj_count_of_cred_pmt >= 24 and (cft.est_cft_balance >= (cft.RUNNING_TOTAL_CRED_PAYMENTS + cft.RUNNING_TOTAL_SETT_FEES)) then true
+                when s.adj_count_of_cred_pmt < 24 and cft.est_cft_balance >= cft.RUNNING_TOTAL_CRED_PAYMENTS then true
+            else false end as pass_offer_term_check_flag
+
+        from cft_balance_post_fees_and_payments as cft
+        left join tl_forecast_settlement_rates as s
+            on cft.tradeline_id = s.tradeline_id
+        where 1=1
+            and s.adj_count_of_cred_pmt = cft.payment_count
+
+)
+
+, fee_term_check as (
+
+        select distinct
+            cft.program_id,
+            cft.tradeline_id,
+
+            case 
+                when s.adj_count_of_cred_pmt >= 24 and (cft.est_cft_balance >= (s.est_settlement_amount + cft.RUNNING_TOTAL_SETT_FEES)) then true
+                when s.adj_count_of_cred_pmt < 24 and cft.est_cft_balance >= cft.RUNNING_TOTAL_CRED_PAYMENTS then true
+            else false end as pass_fee_term_check_flag
+
+        from cft_balance_post_fees_and_payments as cft
+        left join tl_forecast_settlement_rates as s
+            on cft.tradeline_id = s.tradeline_id
+        where 1=1
+            and case when s.adj_count_of_cred_pmt >= 24 then 24 else s.adj_count_of_cred_pmt end = cft.payment_count
+
+
+)
+
+, intermediate_payment_check as (
+
+        select distinct
+            cft.program_id,
+            cft.tradeline_id,
+            case when i.tradeline_id is null then true else false end as pass_intermediate_pmt_check_flag
+            
+
+        from cft_balance_post_fees_and_payments as cft
+        left join (
+                select distinct
+                    cft.program_id,
+                    cft.tradeline_id,
+                    case when cft.est_cft_balance >= cft.RUNNING_TOTAL_CRED_PAYMENTS then true else false end as pass_inter_pmt_check_flag
+        
+                from cft_balance_post_fees_and_payments as cft
+                left join tl_forecast_settlement_rates as s
+                    on cft.tradeline_id = s.tradeline_id
+                where 1=1
+                    and cft.payment_count between 2 and (s.adj_count_of_cred_pmt - 1)
+                    and pass_inter_pmt_check_flag = false
+
+            ) as i
+            on cft.tradeline_id = i.tradeline_id
+
+)
+
+, tls_failing_affordability_checks as (
+
+        select distinct
+            program_id,
+            tradeline_id,
+            failed_affordability_checks_flag
+        from cft_balance_post_fees_and_payments
+        where 1=1
+            and failed_affordability_checks_flag = true
+
+)
+
+
+, tls_failing_36_month_affordability_checks as (
+
+        select distinct
+            program_id,
+            tradeline_id,
+            failed_affordability_checks_flag
+        from cft_balance_post_fees_and_payments_out_36_months
+        where 1=1
+            and failed_affordability_checks_flag = true
+            and outside_forecasted_cft_balance_flag = false
+
+)
+
+
+
+, tls_min_cft_balance as (
+
+        select distinct
+            program_id,
+            tradeline_id,
+            min(ending_cft_balance_adj) as min_ending_cft_balance
+        from cft_balance_post_fees_and_payments
+        where 1=1
+        group by 1,2
+)
+
+
+//** ## End Affordability Checks
+
+, deposit_cleared_scheduled_or_in_transit_current_month as (
+        SELECT
+            at.program_id_c as program_id
+        from active_tls_at_beg_of_month as a
+        left join refined_prod.bedrock.transaction_c at
+            on at.program_id_c = a .program_id and at.is_deleted = false
+        WHERE 1=1
+            and at.type_c in ('Deposit')
+            and at.status_c in ('In_Transit','Scheduled','Completed') --might want to remove completed
+            and at.program_id_c is not null
+            and last_day(at.scheduled_date_c) >= $QueueMonth
+            
+        ORDER BY at.program_id_c, at.scheduled_date_c ASC
+
+        )
+
+, completed_deposit_in_last_60_days_flag as (
+        SELECT
+            at.program_id_c as program_id
+        from active_tls_at_beg_of_month as a
+        left join refined_prod.bedrock.transaction_c at
+            on at.program_id_c = a .program_id and at.is_deleted = false
+        WHERE 1=1
+            and at.type_c in ('Deposit')
+            and at.status_c in ('Completed') 
+            and at.program_id_c is not null
+            and datediff('day',at.scheduled_date_c,current_date()) <= 60
+            
+        ORDER BY at.program_id_c, at.scheduled_date_c ASC
+
+        )
+
+   
+, ipl_funded_programs as (
+
+    select distinct
+        a.program_name,
+        a.current_status
+ 
+    from REFINED_PROD.ABOVE_LENDING.AGL_COMBINED_DETAIL as a
+    where 1=1
+        and a.CURRENT_STATUS in ('ONBOARDED')
+
+)
+
+
+
+--, tls_with_bulk_offers_forecasted as (
+    --unsing Andy & Nick's query to look at TLs that have never matched but have a higher likihood of matching - focused on a couple creditors
+    
+                    --looking to define relevant bulk unamatched stuff 
+                    , runner_bof as (
+                        SELECT
+                            at.program_id_c as program_id
+                            , p.program_name
+                            , at.offer_id_c as offer_id
+                            , at.status_c as transaction_status
+                            , at.type_c as transaction_type
+                            --in refined all transacitons are positive value so this just reverses the sign for transactions that subtract from the account
+                            , CASE WHEN at.type_c NOT IN ('Deposit', 'Reversal', 'Loan', 'Advance') THEN -at.amount_c ELSE at.amount_c END as transaction_amount
+                            --deposits take five days to clear on average, so we adjust the scheduled date of deposit transactions to add five days for when it "hits"
+                            , CASE WHEN at.type_c = 'Deposit' THEN at.scheduled_date_c + 5 ELSE at.scheduled_date_c END as adj_scheduled_date_cst
+                        FROM refined_prod.bedrock.transaction_c at
+                        LEFT JOIN curated_prod.crm.offer o ON at.offer_id_c = o.offer_id AND o.is_current_record_flag
+                        LEFT JOIN curated_prod.crm.program p ON at.program_id_c = p.program_id AND p.is_current_record_flag
+                        WHERE at.status_c NOT IN ('Cancelled', 'Returned', 'Suspended', 'Failed', 'Stopped') --to exclude transactions that aren't valid or didn't process
+                        AND NOT(at.type_c = 'Deposit' AND at.status_c = 'Proposal') --decided with Nick/Ruchir that we don't want to include propsed deposits
+                        ---this piece is to exclude proposal service and blp fees
+                        AND NOT(at.type_c = 'Fee' AND (to_number(at.amount_c,10,2) = -10.75 OR to_number(at.amount_c,10,2) = -14.95) AND at.status_c = 'Proposal')
+                        AND adj_scheduled_date_cst >= current_date --transactions scheduled today or in the future
+                        --this is to follow product logic, we exclude any deposits that are in transit/delivery for more than 5 days, if they clear they'll be counted when status changes
+                        AND NOT(type_c = 'Deposit' AND status_c IN ('In_Transit', 'In_Delivery') AND datediff(day, scheduled_date_c, current_date) >5)
+                        --this excludes any deposits where the adjusted scheduled date is after today, but are already completed
+                        --we do this because they'll be taken in to account via the current balance CTE when they complete, so we don't want to double count them
+                        AND NOT(adj_scheduled_date_cst >= current_date AND at.status_c = 'Completed' AND type_c = 'Deposit')
+                        AND at.is_deleted = false
+                        AND (o.offer_status IS NULL OR o.offer_status NOT IN ('Expired', 'Cancelled', 'Rejected'))   --exclude non-active offers from the runner
+                      --  AND at.program_id_c = 'a165d00000Lg96EAAR'
+                        AND p.program_status = 'Enrolled'
+                        ORDER BY at.program_id_c, adj_scheduled_date_cst ASC
+                    )
+                    --this filler cte creates a dummy transaction at the last day of the month
+                    --we need to do this because available funds for any given month starts at the last day of the month and looks forward
+                    --since there's not always a transaction scheduled on the last day of the month, this just makes it easier to calc available funds below
+                    --just manually create a $0 transaction so we have a placeholder there to utilize, but it doesn't affect the balance
+                    , filler_bof as (
+                        SELECT
+                            DISTINCT program_id, program_name, NULL as offer_id, NULL as transaction_status, 'filler' as transaction_type, 0 as transaction_amount, end_of_month as adj_scheduled_date_cst
+                        FROM runner_bof
+                        CROSS JOIN (
+                            SELECT last_day( current_Date + x-1, month) as end_of_month
+                            from (
+                              select row_number() over(order by 0) x 
+                              from table(generator(rowcount => 1462)))
+                            group by 1
+                            order by 1
+                        )
+                        ORDER BY 1,2
+                    )
+                    ---this cte will get the "calculated" current balance in the cft account, at the program level
+                    ---theoretically this should match up with the stored current balance, but we use this as the source of truth
+                    , current_balance_bof as (
+                        --the outer query is just to simplify the output, to get the program id and current balanace value (running balance at last transaction)
+                        SELECT
+                            program_id
+                            , running_balance as current_balance
+                        FROM (
+                            --this inner query is similar to the first runner CTE, but looks at historical up to today, to recreate the current balance as of today
+                            SELECT
+                                at.program_id_c as program_id
+                                , p.program_name
+                                , at.offer_id_c as offer_id
+                                , at.status_c as transaction_status
+                                , at.type_c as transaction_type
+                                , CASE WHEN at.type_c NOT IN ('Deposit', 'Reversal', 'Loan', 'Advance', 'Refund') THEN -at.amount_c ELSE at.amount_c END as transaction_amount
+                                , CASE WHEN at.type_c = 'Deposit' THEN at.scheduled_date_c + 5 ELSE at.scheduled_date_c END as adj_scheduled_date_cst
+                                --this will calculate the runner balance by scheduled date, to get the current balance via the last transaction up to today
+                                , SUM(transaction_amount) OVER(PARTITION BY at.program_id_c ORDER BY adj_scheduled_date_cst ASC) as running_balance
+                            FROM refined_prod.bedrock.transaction_c at
+                            LEFT JOIN curated_prod.crm.offer o ON at.offer_id_c = o.offer_id AND o.is_current_record_flag
+                            LEFT JOIN curated_prod.crm.program p ON at.program_id_c = p.program_id AND p.is_current_record_flag
+                            WHERE at.status_c NOT IN ('Cancelled', 'Returned', 'Suspended', 'Failed', 'Stopped', 'Proposal', 'Estimate') --exclude transactions that didn't affect the balance
+                            --this is the reverse of the completed deposit filter in the runner cte where clause
+                            --we only look at transactions scheduled in the psat, unless it's a completed deposit (since we expect deposits to clear after 5 days, but they can clear faster than that, so it could still have an adjusted scheduled day in the future, but already be complete)
+                            AND (adj_scheduled_date_cst < current_date OR (type_c = 'Deposit' AND status_c = 'Completed'))
+                            --this excludes any in transit/pending/etc transactions that are greater than 30 days old, except if they're service/blp fees, then we always include those
+                            AND (datediff(day, adj_scheduled_date_cst, current_date) <= 30 OR at.status_c NOT IN ('In_Transit', 'Pending', 'In_Delivery', 'Scheduled', 'Estimate') OR at.amount_c <> -10.75 OR at.amount_c <> -14.95)
+                            AND at.is_deleted = false
+                            --excludes deposits that are in transit for longer than 5 days
+                            AND NOT(type_c = 'Deposit' AND status_c IN ('In_Transit', 'In_Delivery') AND datediff(day, scheduled_date_c, current_date) >5)
+                           -- AND at.program_id_c = 'a165d00000Lg96EAAR'
+                            AND p.program_status = 'Enrolled'
+                            --the qualify is just to get the last transaction by scheduled date, since we only want the current balance we only care about the running balance at most recent transaction
+                            QUALIFY ROW_NUMBER() OVER(PARTITION BY at.program_id_c ORDER BY adj_scheduled_date_cst DESC) = 1
+                            ORDER BY at.program_id_c, adj_scheduled_date_cst ASC
+                        )
+                    )
+                    --this is how we actually project out the running balance using the current balance from that CTE, and the projected transactions from the runner cte
+                    --also does this at the program level
+                    , running_balance_bof as (
+                        SELECT 
+                            t.*
+                            , cb.current_balance
+                            --uses the actual transactions amounts and the current account balance to project out the running balance going forward
+                            , round(sum(transaction_amount) over (partition by t.program_id order by adj_scheduled_date_cst asc) + cb.current_balance,2) as running_balance
+                        FROM (
+                            --unions the future scheduled runner, and filler end-of-month transactions, because the manually created filler transactions are not actually in the runner, but we want to make sure there's a transaction for every program at the end of every month
+                            SELECT * FROM runner_bof
+                            UNION ALL
+                            SELECT * FROM filler_bof
+                        ) t
+                        LEFT JOIN current_balance cb ON t.program_id = cb.program_id
+                        ORDER BY program_id, adj_scheduled_date_cst
+                    )
+                    --this just uses the running balance to find the min balance at each transaction, to the end of the runner, we'll use this to calculate available funds
+                    , min_running_bof as (
+                        SELECT
+                            r.*
+                            , min(running_balance) OVER(PARTITION BY program_id ORDER BY adj_scheduled_date_cst ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) as min_future_balance
+                        FROM running_balance_bof r
+                        ORDER BY program_id, adj_scheduled_date_cst
+                    )
+                    --this is where we'll actually calculate available funds based on the running and min running balance
+                    --it's basically going to look at the last day of the month, and then find the min balance in the runner among all transactions scheduled after that date
+                    --i.e. if it's september 26, it's going to look at all transactions september 30 and onward, and find the min running balance
+                    --it's duplicated because we want the values starting at end of current month, end of next month, two months from now, etc., and that's how we'll get month 1/2/3/etc. available funds (where month 1 funds is started at end of current month)
+                    --I have been referring to these values as the calculated available funds, which we use to compared against the system/log stored values
+                    , min_monthly_bof as (
+                        SELECT
+                            program_id
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(current_date, month) THEN min_future_balance ELSE NULL END) as month_1_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 1, current_date), month) THEN min_future_balance ELSE NULL END) as month_2_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 2, current_date), month) THEN min_future_balance ELSE NULL END) as month_3_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 3, current_date), month) THEN min_future_balance ELSE NULL END) as month_4_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 4, current_date), month) THEN min_future_balance ELSE NULL END) as month_5_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 5, current_date), month) THEN min_future_balance ELSE NULL END) as month_6_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 6, current_date), month) THEN min_future_balance ELSE NULL END) as month_7_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 7, current_date), month) THEN min_future_balance ELSE NULL END) as month_8_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 8, current_date), month) THEN min_future_balance ELSE NULL END) as month_9_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 9, current_date), month) THEN min_future_balance ELSE NULL END) as month_10_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 10, current_date), month) THEN min_future_balance ELSE NULL END) as month_11_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 11, current_date), month) THEN min_future_balance ELSE NULL END) as month_12_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 12, current_date), month) THEN min_future_balance ELSE NULL END) as month_13_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 13, current_date), month) THEN min_future_balance ELSE NULL END) as month_14_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 14, current_date), month) THEN min_future_balance ELSE NULL END) as month_15_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 15, current_date), month) THEN min_future_balance ELSE NULL END) as month_16_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 16, current_date), month) THEN min_future_balance ELSE NULL END) as month_17_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 17, current_date), month) THEN min_future_balance ELSE NULL END) as month_18_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 18, current_date), month) THEN min_future_balance ELSE NULL END) as month_19_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 19, current_date), month) THEN min_future_balance ELSE NULL END) as month_20_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 20, current_date), month) THEN min_future_balance ELSE NULL END) as month_21_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 21, current_date), month) THEN min_future_balance ELSE NULL END) as month_22_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 22, current_date), month) THEN min_future_balance ELSE NULL END) as month_23_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 23, current_date), month) THEN min_future_balance ELSE NULL END) as month_24_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 27, current_date), month) THEN min_future_balance ELSE NULL END) as month_28_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 29, current_date), month) THEN min_future_balance ELSE NULL END) as month_30_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 34, current_date), month) THEN min_future_balance ELSE NULL END) as month_35_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 35, current_date), month) THEN min_future_balance ELSE NULL END) as month_36_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 39, current_date), month) THEN min_future_balance ELSE NULL END) as month_40_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 44, current_date), month) THEN min_future_balance ELSE NULL END) as month_45_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 45, current_date), month) THEN min_future_balance ELSE NULL END) as month_46_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 46, current_date), month) THEN min_future_balance ELSE NULL END) as month_47_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 47, current_date), month) THEN min_future_balance ELSE NULL END) as month_48_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 48, current_date), month) THEN min_future_balance ELSE NULL END) as month_49_af
+                            , MIN(CASE WHEN adj_scheduled_date_cst >= last_day(dateadd(month, 59, current_date), month) THEN min_future_balance ELSE NULL END) as month_60_af
+                        FROM min_running_bof
+                        GROUP BY 1
+                    )
+                    , other_legal_tradeline_bof as (
+                        select distinct program_id
+                            from curated_prod.crm.tradeline t 
+                                where t.is_current_record_flag = true
+                                and t.is_legal_flag = true and t.tradeline_Status = 'Pre-Settlement'
+                    )
+                    , bank_account_bof as (
+                        select distinct program_id_c
+                            from refined_prod.bedrock.bank_account_c ba
+                        where ba.status_c = 'ACTIVE'
+                            and ba.is_deleted= false
+                    )
+                    
+                , tls_with_bulk_offers_forecasted as (
+                    
+                    select tradeline_id, tradeline_name, p.program_id, p.program_name, p.service_entity_name
+                        , t.enrolled_balance, t.negotiation_balance, ifnull(t.negotiation_balance, t.enrolled_balance) as current_balance, p.settlement_fee_percentage/100 as fee_required
+                        , n.creditor_name as negotiating_creditor, o.creditor_name as original_creditor
+                        , date_trunc('month', p.enrolled_date_cst) as enrollment_vintage, t.last_tradeline_note_date_time_cst
+                        , pt.last_payment_date_c, datediff('day', last_payment_date_c, to_date('2023-11-17'))-30 as dq_days
+                        , floor(dq_days/30,0)*30 as normalized_dq,  case when datediff('day', ifnull(t.last_tradeline_note_date_time_cst,to_date('2000-01-01')), current_date) > 30 then true else false end as thirty_days_since_last_note
+                        , mm.month_1_af, month_3_af, month_6_af, mm.month_12_af, mm.Month_20_af, mm.month_24_af, mm.month_30_af, mm.month_36_af
+                        , case when olt.program_id is not null then true else false end as other_legal_tradeline_check
+                        , case when ba.program_id_c is null then true else false end as blocked_Bank_Check, t.is_legal_flag
+                        , case when t.last_match_date_cst is null then 'Never Matched' when datediff('day', t.last_match_Date_cst, current_date) > 90 then 'Old Match Only' else 'Current Match' end as had_match
+                        , t.negotiator_queue,
+                    
+                        case 
+                            when negotiating_creditor ilike ('%Capital One%') and normalized_dq >= 210 then true
+                            when negotiating_creditor ilike ('%First Premier Bank%') and normalized_dq >= 90 then true
+                            when negotiating_creditor ilike ('%Discover%') and normalized_dq >= 240 then true
+                            when negotiating_creditor ilike ('%Wells Fargo%') and normalized_dq >= 240 then true
+                            when negotiating_creditor ilike ('%Comenity Bank%') and p.service_entity_name in ('Beyond Finance') and normalized_dq >= 180 then true
+                            when negotiating_creditor ilike ('%Synchrony Bank%') and p.service_entity_name in ('Beyond Finance')and normalized_dq >= 180 then true
+                            when negotiating_creditor ilike ('Midland Credit Management%%') and normalized_dq >= 0 then true
+                        else false end as dq_checks,
+                    
+                    
+                        case 
+                            when negotiating_creditor ilike ('%First Premier Bank%') and mm.MONTH_1_AF >= (current_balance*0.5/3) and mm.MONTH_3_AF >= (current_balance*0.5+t.enrolled_balance*fee_required) then true
+                            
+                            when negotiating_creditor ilike ('%Discover%') and mm.MONTH_1_AF >= (current_balance*0.7/36) and mm.MONTH_6_AF >= (current_balance*0.7/36*6) and mm.MONTH_12_AF >= (current_balance*0.7/36*12) and mm.MONTH_24_AF >= ((current_balance*0.7/36*24) + (t.enrolled_balance*fee_required)) and mm.MONTH_36_AF >= ((current_balance*0.7) + (t.enrolled_balance*fee_required)) then true
+                            
+                            when negotiating_creditor ilike ('%Wells Fargo%') and mm.MONTH_1_AF >= (current_balance*0.4/24) and mm.MONTH_12_AF >= (current_balance*0.4/24*12) and mm.MONTH_24_AF >= ((current_balance*0.4) + (t.enrolled_balance*fee_required)) then true
+                            
+                            when negotiating_creditor ilike ('%Synchrony Bank%') and p.service_entity_name in ('Beyond Finance') and mm.MONTH_1_AF >= (current_balance*0.45/24) and mm.MONTH_12_AF >= (current_balance*0.45/24*12) and mm.MONTH_24_AF >= ((current_balance*0.45) + (t.enrolled_balance*fee_required)) then true
+                            
+                            when negotiating_creditor ilike ('%Comenity Bank%') and p.service_entity_name in ('Beyond Finance') and mm.MONTH_1_AF >= (current_balance*0.45/6) and mm.MONTH_6_AF >= (current_balance*0.45) and mm.MONTH_24_AF >= ((current_balance*0.45) + (t.enrolled_balance*fee_required)) then true
+                            
+                            when negotiating_creditor ilike ('%Midland Credit Management%') and mm.MONTH_1_AF >= (current_balance*0.5/6) and mm.MONTH_6_AF >= (current_balance*0.5) and mm.MONTH_12_AF >= ((current_balance*0.5) + (t.enrolled_balance*fee_required)) then true
+                    
+                            else false end as affordability_checks,
+                    
+                            case when dq_checks = true and affordability_checks = true then true else false end as forecasted_bulk_offer_flag
+                    
+                    
+                        
+                        from curated_prod.crm.tradeline t
+                            left join curated_prod.crm.creditor n on t.negotiating_creditor_id = n.creditor_id and n.is_current_record_flag = true
+                            left join curated_prod.crm.creditor o on t.original_creditor_id = o.creditor_id and o.is_current_record_flag = true
+                            left join curated_prod.crm.program p on t.program_id = p.program_id and p.is_current_record_flag = true
+                            left join refined_prod.bedrock.program_tradeline_c pt on t.tradeline_id = pt.id and pt.is_deleted = false
+                            left join min_monthly_bof mm on t.program_id = mm.program_id
+                            left join other_legal_tradeline_bof olt on t.program_id = olt.program_id 
+                            left join bank_account_bof ba on t.program_id = ba.program_id_c
+                        where t.is_current_record_flag = true
+                            and n.is_bulk_creditor_flag = true
+                     --       and last_match_date_c_cst is null
+                            and had_match in ('Never Matched','Old Match Only')
+                            --and ifnull(t.last_match_date_cst,to_Date('2023-01-01')) < to_Date('2023-06-01')
+                            and t.tradeline_status = 'Pre-Settlement' 
+                            and t.tradeline_id not in (select distinct tradeline_id from curated_prod.crm.offer where is_current_record_flag = true)
+                            and p.program_status = 'Enrolled'
+)
+
+,queue_volumes as (
+
+    select distinct
+    
+            a.tradeline_name,
+            a.program_name,
+            a.tradeline_id,
+            a.program_id,
+            p.SERVICE_ENTITY_CODE_C,
+            tl_now.negotiator_queue_c as current_ntl_queue,
+            ifnull(tl_now.IS_LEGAL_FLAG_C,false) as tl_is_legal_flag,
+            --pt.tradeline_status,
+            case when tl_is_legal_flag = true then 'Legal' else tl_now.TYPE_C end as settlement_type,
+            
+            a.record_date,
+            a.record_month as queue_month,
+            case when tl_now.HOLD_UNTIL_DATE_C_CST is null then false when current_date() < tl_now.HOLD_UNTIL_DATE_C_CST then true else false end as has_future_hold_date_flag,
+            tl_now.HOLD_UNTIL_DATE_C_CST,
+            tl_now.SETTLEMENT_DISPOSITION_C,            
+            tl_now.LAST_DISPOSITION_DATE_C_CST,
+ 
+            tl_now.CSD_TRADELINE_PROGRESS_C,
+            tl_now.CSD_TRADELINE_PROGRESS_DETAIL_C,
+            
+            sr.negotiation_bal,
+            dq.current_tl_dq,
+            dq.creditor_min_days_dq,
+            dq.negotiating_creditor_name,
+            dq.negotiating_cred_id,
+
+            cft.min_ending_cft_balance,
+
+    
+            case when fd.program_name is not null then true else false end as has_completed_fd_flag,
+            case when tl_is_legal_flag = false and lgl.program_id is not null then true else false end as tl_not_legal_program_has_unsettled_legal_tls_flag,
+            case when tl_now.charged_off_flag_c = true then false when dq.fails_min_dq_creditor_thresholds = true or dqc.tradeline_id is not null then true else false end as tl_fails_dq_checks,
+            case when o.tradeline_id is not null then true else false end as tl_has_active_offer_flag,
+            ifnull(fa.failed_affordability_checks_flag,false) as tl_failed_affordability_checks_flag,
+
+            fpc.pass_first_payment_check_flag as afford_first_pmt_check_flag,
+            otc.pass_offer_term_check_flag as afford_offer_term_check_flag,
+            ftc.pass_fee_term_check_flag as afford_fee_term_check_flag,
+            ipc.pass_intermediate_pmt_check_flag as afford_intermediate_pmt_check_flag,
+
+            iff(m36.tradeline_id is not null,true,false) as fail_36_month_affordability_check_flag,
+            iff(p_out.tradeline_id is not null,true,false) as has_cred_payment_outside_forecsated_cft_balance_flag,
+
+
+            iff(cd60.program_id is not null,true,false) as has_completed_deposit_in_last_60_days_flag,
+            iff(cb.available_balance < 0,true,false) as current_cft_balance_negative,
+
+            sr.OFFER_PERCENT_C_COAL,
+            sr.adj_count_of_cred_pmt,
+            sr.count_first_set_cred_pmt,
+            sr.count_final_set_of_payments,
+            sr.first_set_pmt_amt,
+            sr.final_set_pmt_amt,
+            sr.USING_DEFAULT_CREDITOR_TERMS_FLAG,
+
+            --Begin Queue Creation Logic
+
+            case 
+                --Unassignment criteria
+                when has_completed_fd_flag = false then '1) No Completed & No Scheduled Deposits'
+                when cftt.program_id is null then '1) No Completed & No Scheduled Deposits'
+
+                when dq.negotiation_bal = 0 then '2) Zero Balance TL'
+
+                when tl_now.is_conditional_debt_flag_c = true and tl_now.conditional_debt_approval_status_c not in ('Approved') then '3) Unapproved Conditional or Medical Debt'
+                when ct.name ilike ('%medical%') and medical_debt_verification_status_c not in ('Verified') then '3) Unapproved Conditional or Medical Debt'
+                
+                when ct.name ilike ('%unknown%') then '4) Unknown or No Creditor'
+                when ct.name is null then '4) Unknown or No Creditor'
+
+                when tl_has_active_offer_flag = true then '5a) TL has Offer (Approved or In-Progress)'
+
+                when tl_crm.TRADELINE_STATUS not in ('Pre-Settlement','Settlement In Approval') then '5b) TL is Removed'
+
+                when has_future_hold_date_flag = true then '6) Has Future Hold Date'
+
+                when tl_fails_dq_checks = true then '7) TL Failed DQ Checks'
+                when dq.current_tl_dq <= dq.creditor_min_days_dq then '7) TL Failed DQ Checks'
+
+                when tl_not_legal_program_has_unsettled_legal_tls_flag = true then '8) Non-Legal TL on Program with Legal TLs'
+                
+                when tl_failed_affordability_checks_flag = true then '9) Failed Affordability Checks'
+                
+                when tl_now.is_nc_legal_flag_c = true then '10) Other' --'NC Legal Flag'
+                when p.external_processor_status_c ilike ('%Cancelled%') then '10) Other' --'External Processor Cancelled'
+                when ipl.program_name is not null then '10) Other' --'IPL Funded Program'
+                
+                --when tl_now.LAST_DISPOSITION_DATE_C_CST is not null and datediff(day,tl_now.LAST_DISPOSITION_DATE_C_CST,current_date()) < 15 then 'Has Disposition in Last 15 Days' --likely could be an area of optimization with what lands in the queue
+                
+                --Bulk Assignment
+                --when last_day(tl_now.last_match_date_c_cst) = a.record_month --has bulk match in current month
+                when datediff(day,tl_now.last_match_date_c_cst,current_date()) <= 30 --has bulk match in last 30 days
+                    and (tl_now.last_disposition_date_c_cst < tl_now.last_match_date_c_cst or tl_now.last_disposition_date_c_cst is null) then 'Bulk Queue'
+
+                --Legal Assignment
+                when tl_now.is_legal_flag_c = true then 'Legal Queue'
+                when settlement_type = 'Legal' then 'Legal Queue'
+
+                --Floor Assignment
+                when ct.name ilike ('%onemain%') then 'OneMain' 
+                when ct.name ilike ('%synchrony%') and p.service_entity_code_c in ('Five_Lakes') then 'FLLG Synchrony'
+                when ct.name ilike ('%comenity%') and p.service_entity_code_c in ('Five_Lakes') then 'FLLG Comenity'
+                when ct.name ilike ('%zwicker%') then 'Zwicker'
+                when tl_now.type_c in ('Floor') and ct.IS_BULK_CREDITOR_FLAG_C != true then 'Floor Queue'
+
+                when ct.IS_BULK_CREDITOR_FLAG_C = true and bof.forecasted_bulk_offer_flag = true then 'Bulk Queue (Offer Likely)'
+                when ct.IS_BULK_CREDITOR_FLAG_C = true then 'Bulk TL or Creditor (Not In Bulk Queue)'
+                when tl_now.type_c in ('Scrub') = true then 'Bulk TL or Creditor (Not In Bulk Queue)'
+            else '10) Other' end as queue_logic,
+        
+
+            case 
+                when queue_logic in ('OneMain','FLLG Synchrony','FLLG Comenity','Zwicker','Bulk Queue (Offer Likely)','Legal Queue','Bulk Queue','Floor Queue') then 'Queue'
+            else 'Exclusion Criteria' end as queue_logic_type
+
+            
+    
+    from active_tls_at_beg_of_month a
+    left join programs_with_completed_deposit as fd
+        on fd.program_id = a.program_id
+    
+    left join unsettled_legal_tls as lgl
+        on lgl.program_id = a.program_id
+    
+    left join forbid_non_dq_cases as dqc
+        on dqc.tradeline_id = a.tradeline_id
+    
+    left join tradelines_failing_dq_checks as dq
+        on dq.tradeline_id = a.tradeline_id
+    
+    left join tl_has_an_active_offer as o
+        on o.tradeline_id = a.tradeline_id
+
+    left join tls_failing_affordability_checks as fa
+        on a.tradeline_id = fa.tradeline_id
+
+    left join tls_min_cft_balance as cft
+        on a.tradeline_id = cft.tradeline_id
+
+    left join refined_prod.bedrock.program_tradeline_c as tl_now
+        on a.tradeline_id = tl_now.id and tl_now.is_deleted = false
+
+    left join refined_prod.bedrock.program_c as p
+        on a.program_id = p.id and p.is_deleted = false
+            
+    left join REFINED_PROD.BEDROCK.CREDITOR_C as ct
+        on coalesce(tl_now.NEGOTIATING_CREDITOR_ID_C,tl_now.collection_agency_id_c,tl_now.debt_buyer_id_c,tl_now.enrolled_creditor_alias_id_c) = ct.id and ct.is_deleted = false     
+
+    left join deposit_cleared_scheduled_or_in_transit_current_month as cftt
+        on a.program_id = cftt.program_id
+
+    left join ipl_funded_programs as ipl
+        on a.program_name = ipl.program_name
+
+    left join tls_with_bulk_offers_forecasted as bof
+        on bof.tradeline_id = a.tradeline_id
+
+    left join first_payment_check as fpc
+        on fpc.tradeline_id = a.tradeline_id
+    
+    left join offer_term_check as otc
+        on otc.tradeline_id = a.tradeline_id
+        
+    left join fee_term_check as ftc
+        on ftc.tradeline_id = a.tradeline_id
+        
+    left join intermediate_payment_check as ipc
+        on ipc.tradeline_id = a.tradeline_id
+
+    left join completed_deposit_in_last_60_days_flag as cd60
+        on cd60.program_id = a.program_id
+
+    left join CURATED_PROD.CFT.DEPOSIT_ACCOUNT_BALANCE as cb
+        on cb.program_id = a.program_id and cb.as_of_date_cst = current_date()
+
+    left join tl_forecast_settlement_rates as sr
+        on sr.tradeline_id = a.tradeline_id
+
+    left join tls_failing_36_month_affordability_checks as m36
+        on m36.tradeline_id = a.tradeline_id
+
+    left join has_cred_payments_outside_forecasted_cft_balance as p_out
+        on a.tradeline_id = p_out.tradeline_id
+
+    left join curated_prod.crm.tradeline as tl_crm
+        on tl_crm.tradeline_id = a.tradeline_id and tl_crm.is_current_record_flag = true
+        
+    where 1=1
+        --and queue_removal_reasons in ('In Queue')
+        --and queue in ('Floor')
+        --and p.service_entity_code_c in ('Beyond_Finance')
+        --and tl_failed_affordability_checks_flag = false
+        --and right(a.tradeline_name,2) in ('12')
+
+    --qualify row_number() over (partition by a.tradeline_id order by queue_month asc) > 1
+    order by 2,1
+    
+ )
+
+ 
+,settlement_prioritization as (
+
+    select 
+        program_name,
+        program_id,
+        tradeline_id,
+        tradeline_name,
+        queue_logic,
+        l1_prio,
+        l2_prio,
+        l3_prio,
+        l4_prio,
+        negotiation_bal,
+        row_number() over (partition by program_name order by l1_prio asc,l2_prio asc,l3_prio asc,l4_prio asc,negotiation_bal asc) as program_level_settlement_prioritization
+
+    from (
+            select distinct
+                q.program_id,
+                q.program_name,
+                q.tradeline_name,
+                q.tradeline_id,
+                q.queue_logic,
+
+                case when q.queue_logic in ('Legal Queue') then 1 else 2 end as l1_prio, --Prioritizing legal tradelines
+                case when ct.creditor_id_c is not null then 1 else 2 end as l2_prio, --Prioritizing creditors with terms in matrix
+    
+                case 
+                    when q.negotiation_bal <= 500 then 0
+                    when q.negotiation_bal <= 1000 then 500
+                else round(q.negotiation_bal/1000,0)*1000 end :: decimal(15,0) as l3_prio, --Prioritizing based on negotiation balance buckets
+    
+                case 
+                    when q.queue_logic in ('Legal Queue') then 1
+                    when q.queue_logic in ('Bulk Queue') then 2
+                    when q.queue_logic in ('Floor Queue') then 3
+                    when q.queue_logic in ('Bulk Queue (Offer Likely)') then 4
+                else 5 end as l4_prio, --Prioritizing bulk queue TLs first
+    
+                q.negotiation_bal
+
+            from queue_volumes as q
+            left join refined_prod.bedrock.creditor_terms_c as ct
+                on q.negotiating_cred_id = ct.creditor_id_c and is_deleted = false
+    
+            where 1=1
+                and queue_logic in ('Floor Queue','Bulk Queue','Legal Queue','Bulk Queue (Offer Likely)')
+                --and q.program_name in ('BRP-000378','BRP-000663','BRP-004519','BRP-156396','BRP-156962')
+    
+            order by q.program_name asc
+            )
+    where 1=1
+        --and program_name in ('BRP-000667','BRP-002912','BRP-050158','BRP-051667')        
+        --and program_id in ('a163h000000zAlyAAE','a163h000000zXnvAAE','a165d00000HM5WhAAL','a165d00000HMAwZAAX')
+    order by 1,11
+
+        
+ )       
+       -- select * from settlement_prioritization
+       -- where program_level_settlement_prioritization = 1
+      
+
+-- 
+
+
+, cft_balance_post_fees_and_payments_on_s1 as ( --cft balance after first settlement payments are made
+        
+        select distinct
+            sett1.program_id,
+            sett1.tradeline_id,
+            --sett1.payment_months_from_offer,
+            sett1.scheduled_month,
+            sett1.ending_cft_balance_adj
+
+        from cft_balance_post_fees_and_payments as sett1 --change to correct CFT
+        left join settlement_prioritization as s1
+            on s1.tradeline_id = sett1.tradeline_id and s1.program_level_settlement_prioritization = 1
+        where 1=1
+            and s1.tradeline_id is not null
+            --and sett1.program_id in ('a163h000000zAlyAAE','a163h000000zXnvAAE','a165d00000HM5WhAAL','a165d00000HMAwZAAX')
+        order by 1,2,3
+
+),
+
+eligibility_checks_for_s2 as (
+
+        select distinct
+            p.program_name,
+            p.program_id,
+            p.tradeline_id,
+            p.tradeline_name,
+            pmt.payment_months_from_offer,
+
+            ifnull(pmt.monthly_cred_payments,0) + ifnull(pmt.monthly_sett_fees,0) as monthly_cred_and_beyond_fees,
+            --pmt.scheduled_month,
+            cft.scheduled_month,
+            cft.ending_cft_balance_adj as cft_balance_net_s1,
+
+            ifnull(cft_balance_net_s1,0) - monthly_cred_and_beyond_fees as cft_balance_net_s2,
+
+            case 
+                when pmt.payment_months_from_offer <= 24 and cft_balance_net_s2 < 30 then true
+                when pmt.payment_months_from_offer > 25 and cft_balance_net_s2 < 0 then true
+            else false end as failed_affordability_checks_flag --setting min 
+
+        --from settlement_prioritization as p
+        from cft_balance_post_fees_and_payments as pmt--change to correct CFT
+        left join settlement_prioritization as p
+            on pmt.tradeline_id = p.tradeline_id
+        left join cft_balance_post_fees_and_payments_on_s1 as cft
+            on cft.program_id = p.program_id and cft.scheduled_month = pmt.scheduled_month
+        where 1=1
+            and p.program_level_settlement_prioritization > 1
+            --and pmt.program_id in ('a163h000000zAlyAAE','a163h000000zXnvAAE','a165d00000HM5WhAAL','a165d00000HMAwZAAX')
+            --and cft.scheduled_month in ('2024-02-29')
+
+        order by 1,2,cft.scheduled_month
+            
+)
+
+
+, tls_passing_affordability_checks_for_s2 as (
+
+        select distinct
+            program_id,
+            tradeline_id,
+            failed_affordability_checks_flag
+        from eligibility_checks_for_s2
+        where 1=1
+            and failed_affordability_checks_flag = false
+ --       group by 1,2
+)
+
+
+, tls_passing_level_2 as (
+
+
+    select distinct
+        s.program_name,
+        s.program_id,
+        s.tradeline_id,
+        s.tradeline_name,
+        s.queue_logic,
+        s.negotiation_bal,
+        s.program_level_settlement_prioritization,
+
+        case when s.program_level_settlement_prioritization = 1 then true else false end as first_settle_tl_flag,
+        case when b.tradeline_id is not null then true else false end as second_settle_tl_flag
+        
+
+
+
+    from settlement_prioritization as s
+    left join (
+            select 
+                p.program_id,
+                p.tradeline_id,
+                s.program_level_settlement_prioritization
+                --row_number() over (partition by p.program_id order by s.program_level_settlement_prioritization asc) as next_tl_to_settle_order
+            from tls_passing_affordability_checks_for_s2 as p
+            left join settlement_prioritization as s
+                on p.tradeline_id = s.tradeline_id and s.program_level_settlement_prioritization > 1
+            where 1=1
+                and p.failed_affordability_checks_flag = false
+            qualify row_number() over (partition by p.program_id order by s.program_level_settlement_prioritization asc) = 1 --grabbing the next tl forecasted to settle
+            ) as b
+        on b.tradeline_id = s.tradeline_id
+    
+    
+    order by 1,7
+
+    )
+
+select distinct
+
+    a.*,
+    ifnull(first_settle_tl_flag,false) as tl_expected_to_settle_first,
+    ifnull(second_settle_tl_flag,false) as tl_expected_to_settle_second
+    
+from queue_volumes as a
+left join tls_passing_level_2 as sett
+    on a.tradeline_name = sett.tradeline_name
+
+)
