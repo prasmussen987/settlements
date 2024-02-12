@@ -23,8 +23,7 @@ Set DQ_Buffer = 0; --Buffer (in days) added to the creditor-level min dq
 
 --drop table BA_SANDBOX.PRASMUSSEN.elig_queues_first_pmt_next_mo_feb_frnt_feb_2;
 
-
-create table BA_SANDBOX.PRASMUSSEN.elig_queues_first_pmt_next_mo_feb_12 as (
+create table BA_SANDBOX.PRASMUSSEN.elig_queues_first_pmt_next_mo_feb_12_v2 as (
 
 
 with
@@ -320,12 +319,22 @@ tl_has_an_active_offer as (
         and scheduled_month_cst <= add_months(last_day(current_date),36)
     order by 2,3
 
+)
 
+, max_cft_scheduled_month as (
+
+    select distinct
+        program_id,
+        scheduled_month_cst
+    from forecasted_cft_balance
+    qualify ROW_NUMBER() OVER(PARTITION BY program_id ORDER BY scheduled_month_cst DESC) = 1
+
+
+)
 
 
 --##### Begin Forecasted Monthly Creditor Payments and Beyond Fees
     
-)
 
 , creditor_matrix_build as (
         select distinct
@@ -724,6 +733,8 @@ tl_has_an_active_offer as (
                 when payment_months_from_offer > 25 and ending_cft_balance_adj < 0 then true
             else false end as failed_affordability_checks_flag, --setting min 
 
+            iff(scheduled_month > max_m.scheduled_month_cst,true,false) as outside_forecasted_cft_balance_flag,
+
 
             ROW_NUMBER() OVER(PARTITION BY cp.program_id,cp.tradeline_id ORDER BY payment_months_from_offer asc) as payment_count
         
@@ -736,6 +747,9 @@ tl_has_an_active_offer as (
 
         left join CURATED_PROD.CFT.DEPOSIT_ACCOUNT_BALANCE as cb
             on cb.program_id = cp.program_id and cb.as_of_date_cst = current_date()
+        
+        left join max_cft_scheduled_month as max_m
+            on cp.program_id = max_m.program_id
         where 1=1
             and monthly_cred_payments > 0
             --and cp.payment_month < 10
@@ -768,6 +782,8 @@ tl_has_an_active_offer as (
                 when payment_months_from_offer <= 24 and ending_cft_balance_adj < 30 then true
                 when payment_months_from_offer > 25 and ending_cft_balance_adj < 0 then true
             else false end as failed_affordability_checks_flag, --setting min 
+            
+            iff(scheduled_month > max_m.scheduled_month_cst,true,false) as outside_forecasted_cft_balance_flag,
 
 
             ROW_NUMBER() OVER(PARTITION BY cp.program_id,cp.tradeline_id ORDER BY payment_months_from_offer asc) as payment_count
@@ -781,12 +797,26 @@ tl_has_an_active_offer as (
 
         left join CURATED_PROD.CFT.DEPOSIT_ACCOUNT_BALANCE as cb
             on cb.program_id = cp.program_id and cb.as_of_date_cst = current_date()
+
+        left join max_cft_scheduled_month as max_m
+            on cp.program_id = max_m.program_id
         where 1=1
             --and monthly_cred_payments > 0
             --and cp.payment_month < 10
             --and failed_affordability_checks_flag = true
         order by 1,2,3
 
+ )
+
+, has_cred_payments_outside_forecasted_cft_balance as (
+
+        select distinct
+            program_id,
+            tradeline_id
+        from cft_balance_post_fees_and_payments
+        where outside_forecasted_cft_balance_flag = true
+
+ 
  )
 
 
@@ -878,7 +908,7 @@ tl_has_an_active_offer as (
         from cft_balance_post_fees_and_payments
         where 1=1
             and failed_affordability_checks_flag = true
- --       group by 1,2
+
 )
 
 
@@ -891,7 +921,8 @@ tl_has_an_active_offer as (
         from cft_balance_post_fees_and_payments_out_36_months
         where 1=1
             and failed_affordability_checks_flag = true
- --       group by 1,2
+            and outside_forecasted_cft_balance_flag = false
+
 )
 
 
@@ -1217,7 +1248,7 @@ tl_has_an_active_offer as (
             tl_now.CSD_TRADELINE_PROGRESS_C,
             tl_now.CSD_TRADELINE_PROGRESS_DETAIL_C,
             
-            dq.negotiation_bal,
+            sr.negotiation_bal,
             dq.current_tl_dq,
             dq.creditor_min_days_dq,
             dq.negotiating_creditor_name,
@@ -1237,7 +1268,8 @@ tl_has_an_active_offer as (
             ftc.pass_fee_term_check_flag as afford_fee_term_check_flag,
             ipc.pass_intermediate_pmt_check_flag as afford_intermediate_pmt_check_flag,
 
-            iff(m36.tradeline_id is null,true,false) as fail_36_month_affordability_check_flag,
+            iff(m36.tradeline_id is not null,true,false) as fail_36_month_affordability_check_flag,
+            iff(p_out.tradeline_id is not null,true,false) as has_cred_payment_outside_forecsated_cft_balance_flag,
 
 
             iff(cd60.program_id is not null,true,false) as has_completed_deposit_in_last_60_days_flag,
@@ -1249,6 +1281,7 @@ tl_has_an_active_offer as (
             sr.count_final_set_of_payments,
             sr.first_set_pmt_amt,
             sr.final_set_pmt_amt,
+            sr.USING_DEFAULT_CREDITOR_TERMS_FLAG,
 
             --Begin Queue Creation Logic
 
@@ -1373,6 +1406,9 @@ tl_has_an_active_offer as (
 
     left join tls_failing_36_month_affordability_checks as m36
         on m36.tradeline_id = a.tradeline_id
+
+    left join has_cred_payments_outside_forecasted_cft_balance as p_out
+        on a.tradeline_id = p_out.tradeline_id
         
     where 1=1
         --and queue_removal_reasons in ('In Queue')
