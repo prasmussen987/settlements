@@ -1,4 +1,3 @@
-
 --Comments / Notes / Items to change
 
         --I am looking at the time period during which creditor payments are being made - need to look at 36 months out as there are some programs that go red-runner after the offer term is over
@@ -22,8 +21,7 @@ Set QueueMonth = '2024-02-29';
 Set DQ_Buffer = 0; --Buffer (in days) added to the creditor-level min dq
 
 --drop table BA_SANDBOX.PRASMUSSEN.elig_queues_first_pmt_next_mo_feb_frnt_feb_2;
-
-create table BA_SANDBOX.PRASMUSSEN.elig_queues_first_pmt_next_mo_feb_12_v2 as (
+create table BA_SANDBOX.PRASMUSSEN.elig_queues_first_pmt_next_mo_feb_12_v4 as (
 
 
 with
@@ -122,7 +120,7 @@ forbid_non_dq_cases as (
 
         datediff('day',dateadd('day', 30, t.last_payment_date_c),current_date()) as current_tl_dq,
 
-        ifnull(ct.DAYS_DELINQUENT_MIN_C,180) + $DQ_Buffer as creditor_min_days_dq, --adding 15 day buffer
+        ifnull(ct.DAYS_DELINQUENT_MIN_C,180) + $DQ_Buffer as creditor_min_days_dq, 
 
         case 
             when current_tl_dq < 0 then true
@@ -173,6 +171,7 @@ tl_has_an_active_offer as (
         and o.offer_status is not null
         and o.offer_status not in ('Cancelled','Rejected','Expired')
 )
+
 
 
 -- forbid_legal_tl as (
@@ -369,7 +368,7 @@ tl_has_an_active_offer as (
         tl.tradeline_status,
         p.SETTLEMENT_FEE_PERCENTAGE,
         
-        coalesce(tl.negotiation_balance,tl.BULK_MATCHING_CURRENT_BALANCE,tl.LATEST_TRADELINE_BALANCE,tl.enrolled_balance,tl.fee_basis_balance) as negotiation_bal,
+        coalesce(tl.negotiation_balance,tl.LATEST_TRADELINE_BALANCE,tl.enrolled_balance,tl.fee_basis_balance) as negotiation_bal,
         coalesce(tl.fee_basis_balance,tl.enrolled_balance,tl.negotiation_balance,tl.BULK_MATCHING_CURRENT_BALANCE,tl.LATEST_TRADELINE_BALANCE) as fee_basis_bal,
         --coalesce(t.negotiating_creditor_id_c,t.originating_creditor_id_c) as negotiating_cred_id,
         t.negotiating_creditor_id_c as negotiating_cred_id,
@@ -384,15 +383,23 @@ tl_has_an_active_offer as (
 
         case 
             when current_tl_dq < 0 then true
-            when current_tl_dq < ifnull(ctm.DAYS_DELINQUENT_MIN_C,180) then true
+            when current_tl_dq < (ifnull(ctm.DAYS_DELINQUENT_MIN_C,180) + $DQ_Buffer) then true
+            when ifnull(t.charged_off_flag_c,false) = false then true
         else false end as fails_min_dq_creditor_thresholds,
+        
         case when fails_min_dq_creditor_thresholds = true then null else iff(coalesce(ct.OFFER_PERCENT_C,ct2.OFFER_PERCENT_C) is null,true,false) end as using_default_creditor_terms_flag,
-
         case when fails_min_dq_creditor_thresholds = true then null else coalesce(ct.OFFER_PERCENT_C,ct2.OFFER_PERCENT_C,$Settle_Rate) end as OFFER_PERCENT_C_COAL,
         case when fails_min_dq_creditor_thresholds = true then null else coalesce(ct.OFFER_TERM_C,ct2.OFFER_TERM_C,$Pmt_Term) end as OFFER_TERM_C_COAL,
         case when fails_min_dq_creditor_thresholds = true then null else coalesce(ct.OFFER_MINIMUM_PAYMENT_C,ct2.OFFER_MINIMUM_PAYMENT_C,$Min_Pay_Amt) end as OFFER_MINIMUM_PAYMENT_C_COAL,
         case when fails_min_dq_creditor_thresholds = true then null else coalesce(ct.PAYMENT_STRUCTURE_C,ct2.PAYMENT_STRUCTURE_C,'Undefined') end as PAYMENT_STRUCTURE_C_COAL,
         case when fails_min_dq_creditor_thresholds = true then null else coalesce(ct.MINIMUM_PAYMENTS_ALLOWED_C,ct2.MINIMUM_PAYMENTS_ALLOWED_C) end as MINIMUM_PAYMENTS_ALLOWED_C_COAL,    
+
+        iff(coalesce(ct.OFFER_PERCENT_C,ct2.OFFER_PERCENT_C) is null,true,false) as using_default_creditor_terms_flag,
+        coalesce(ct.OFFER_PERCENT_C,ct2.OFFER_PERCENT_C,$Settle_Rate) as OFFER_PERCENT_C_COAL,
+        coalesce(ct.OFFER_TERM_C,ct2.OFFER_TERM_C,$Pmt_Term) as OFFER_TERM_C_COAL,
+        coalesce(ct.OFFER_MINIMUM_PAYMENT_C,ct2.OFFER_MINIMUM_PAYMENT_C,$Min_Pay_Amt) as OFFER_MINIMUM_PAYMENT_C_COAL,
+        coalesce(ct.PAYMENT_STRUCTURE_C,ct2.PAYMENT_STRUCTURE_C,'Undefined') as PAYMENT_STRUCTURE_C_COAL,
+        coalesce(ct.MINIMUM_PAYMENTS_ALLOWED_C,ct2.MINIMUM_PAYMENTS_ALLOWED_C) as MINIMUM_PAYMENTS_ALLOWED_C_COAL,
 
  --       case when fails_min_dq_creditor_thresholds = true then null else iff(coalesce(ct.OFFER_PERCENT_C,ct2.OFFER_PERCENT_C) is null,true,false) end as using_default_creditor_terms_flag,
 
@@ -491,7 +498,7 @@ tl_has_an_active_offer as (
         
     where 1=1
         and t.is_deleted = false
-        and fails_min_dq_creditor_thresholds = false
+        --and fails_min_dq_creditor_thresholds = false
         and negotiation_bal > 0
         and p.program_status in ('Enrolled')
         and tl.TRADELINE_STATUS in ('Pre-Settlement','Settlement In Approval')
@@ -1259,7 +1266,10 @@ tl_has_an_active_offer as (
     
             case when fd.program_name is not null then true else false end as has_completed_fd_flag,
             case when tl_is_legal_flag = false and lgl.program_id is not null then true else false end as tl_not_legal_program_has_unsettled_legal_tls_flag,
-            case when tl_now.charged_off_flag_c = true then false when dq.fails_min_dq_creditor_thresholds = true or dqc.tradeline_id is not null then true else false end as tl_fails_dq_checks,
+            case 
+                when tl_now.charged_off_flag_c = true then false 
+                when dq.fails_min_dq_creditor_thresholds = true or dqc.tradeline_id is not null then true 
+            else false end as tl_fails_dq_checks,
             case when o.tradeline_id is not null then true else false end as tl_has_active_offer_flag,
             ifnull(fa.failed_affordability_checks_flag,false) as tl_failed_affordability_checks_flag,
 
@@ -1298,7 +1308,9 @@ tl_has_an_active_offer as (
                 when ct.name ilike ('%unknown%') then '4) Unknown or No Creditor'
                 when ct.name is null then '4) Unknown or No Creditor'
 
-                when tl_has_active_offer_flag = true then '5) TL has Offer (Approved or In-Progress)'
+                when tl_has_active_offer_flag = true then '5a) TL has Offer (Approved or In-Progress)'
+
+                when tl_crm.TRADELINE_STATUS not in ('Pre-Settlement','Settlement In Approval') then '5b) TL is Removed'
 
                 when has_future_hold_date_flag = true then '6) Has Future Hold Date'
 
@@ -1409,6 +1421,9 @@ tl_has_an_active_offer as (
 
     left join has_cred_payments_outside_forecasted_cft_balance as p_out
         on a.tradeline_id = p_out.tradeline_id
+
+    left join curated_prod.crm.tradeline as tl_crm
+        on tl_crm.tradeline_id = a.tradeline_id and tl_crm.is_current_record_flag = true
         
     where 1=1
         --and queue_removal_reasons in ('In Queue')
