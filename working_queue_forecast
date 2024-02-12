@@ -23,7 +23,7 @@ Set DQ_Buffer = 0; --Buffer (in days) added to the creditor-level min dq
 
 --drop table BA_SANDBOX.PRASMUSSEN.elig_queues_first_pmt_next_mo_feb_frnt_feb_2;
 
-create table BA_SANDBOX.PRASMUSSEN.elig_queues_first_pmt_next_mo_feb_12_v2_2 as (
+create table BA_SANDBOX.PRASMUSSEN.elig_queues_first_pmt_next_mo_feb_12_v2 as (
 
 
 with
